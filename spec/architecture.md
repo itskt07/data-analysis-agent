@@ -68,12 +68,18 @@ FastAPI (uvicorn, port 8001)
 | matplotlib (Agg backend) | Chart rendering → base64 PNG |
 | google-genai | Gemini client (narrative) |
 | structlog | Structured logging |
+| scikit-learn + joblib (Phase 2) | Model training + artifact serialization |
+| apscheduler (Phase 3) | In-process `BackgroundScheduler` for recurring EDA runs — no broker |
 
 **Avoid in Phase 1:** worker queues, distributed processing, and heavyweight MLOps stacks — kept out to keep Phase 1 the smallest testable win.
 
+### Phase 3 — Scheduling (in-process, no broker)
+
+Phase 3 adds an **APScheduler `BackgroundScheduler`** started in the FastAPI lifespan (`src/api/__init__.py`, after `init_db()`) and a `src/scheduling/scheduler.py` module owning it. It fires each active schedule's interval job **in-process** (a background thread in the same uvicorn process), reusing the synchronous EDA runner `run_agent`; a **Run now** endpoint executes the same logic synchronously in the request. Schedule definitions (incl. the stored CSV BLOB) live in the SQLite `schedules` table and are re-registered on startup. Delivery is a best-effort webhook POST after each run (non-fatal). Still **no Redis/Celery/RQ, no Postgres, no object store** — the lightweight single-process model is preserved. See [agent.md](agent.md) (Phase 3 — Scheduling) and [data.md](data.md).
+
 ## Deferred to future phases
 
-- **Postgres** (managed metadata store), **Redis + Celery/RQ** (worker queue for longer training runs), **S3 / object storage** (artifact store), and **auth (JWT/API key)** are all **out of Phase 1**. They may be introduced when Phase 2 (training) or Phase 3 (scheduling/delivery) is scoped, if load or requirements justify it — not before.
+- **Postgres** (managed metadata store), **Redis + Celery/RQ** (worker queue), **S3 / object storage** (artifact store), and **auth (JWT/API key)** are **not used in Phases 1–3**. Phase 3 scheduling is deliberately **in-process** (APScheduler) rather than a broker. These may be introduced in Phase 4 (cron cadence, auth, richer delivery, durable scheduling) if load or requirements justify it — not before.
 
 ## Deployment Model
 

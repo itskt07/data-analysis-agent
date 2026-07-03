@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 type RunResult = {
   run_id: string
@@ -298,15 +298,8 @@ export default function Home() {
       {/* Train a model (Phase 2 — live) */}
       <TrainPanel />
 
-      {/* Coming-soon stubs */}
-      <section className="mt-14 grid gap-4 sm:grid-cols-2" aria-label="Upcoming features">
-        <ComingSoon
-          title="Schedule recurring runs"
-          phase="Phase 3"
-          description="Save a pipeline, run it on a schedule, and deliver reports by email or webhook."
-          testid="stub-schedule"
-        />
-      </section>
+      {/* Schedule recurring runs (Phase 3 — live) */}
+      <SchedulePanel />
     </main>
   )
 }
@@ -760,40 +753,550 @@ function TrainPanel() {
   )
 }
 
-function ComingSoon({
-  title,
-  phase,
-  description,
-  testid,
-}: {
-  title: string
-  phase: string
-  description: string
-  testid: string
-}) {
+type ScheduleSummary = {
+  schedule_id: string
+  name: string
+  filename: string
+  interval_minutes: number
+  webhook_url: string | null
+  active: boolean
+  last_run_at: string | null
+  created_at: string
+}
+
+type ScheduleRunLink = {
+  run_id: string
+  status: 'completed' | 'failed'
+  report_url: string | null
+  created_at: string
+}
+
+type ScheduleDetail = ScheduleSummary & { runs: ScheduleRunLink[] }
+
+// Shared error-envelope reader: matches the {detail:{message}} / {detail} shapes
+// used across the API, falling back to the HTTP status.
+function readError(payload: unknown, status: number): string {
+  const p = payload as { detail?: { message?: string } | string } | null
+  const message = (p?.detail as { message?: string })?.message ?? p?.detail
+  return typeof message === 'string' ? message : `Request failed (${status})`
+}
+
+function formatTimestamp(iso: string | null): string {
+  if (!iso) return 'never'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
+}
+
+function SchedulePanel() {
+  const [file, setFile] = useState<File | null>(null)
+  const [name, setName] = useState('')
+  const [interval, setInterval] = useState('60')
+  const [webhook, setWebhook] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [validation, setValidation] = useState<string | null>(null)
+
+  const [schedules, setSchedules] = useState<ScheduleSummary[]>([])
+  const [listLoading, setListLoading] = useState(true)
+  const [listError, setListError] = useState<string | null>(null)
+
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const loadSchedules = useCallback(async () => {
+    setListLoading(true)
+    setListError(null)
+    try {
+      const res = await fetch('/schedules')
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) {
+        setListError(readError(payload, res.status))
+        return
+      }
+      const data: ScheduleSummary[] | undefined = payload?.data
+      setSchedules(Array.isArray(data) ? data : [])
+    } catch {
+      setListError('Network error — is the server running?')
+    } finally {
+      setListLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadSchedules()
+  }, [loadSchedules])
+
+  function pickFile(f: File | null) {
+    setValidation(null)
+    setError(null)
+    if (!f) {
+      setFile(null)
+      return
+    }
+    const isCsv = f.name.toLowerCase().endsWith('.csv') || f.type === 'text/csv'
+    if (!isCsv) {
+      setValidation('Please choose a .csv file.')
+      setFile(null)
+      return
+    }
+    if (f.size === 0) {
+      setValidation('That file is empty. Choose a CSV with data.')
+      setFile(null)
+      return
+    }
+    if (f.size > MAX_BYTES) {
+      setValidation('That file is larger than 50 MB. Choose a smaller CSV.')
+      setFile(null)
+      return
+    }
+    setFile(f)
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setValidation(null)
+    setError(null)
+    if (!file) {
+      setValidation('Choose a CSV file to schedule first.')
+      return
+    }
+    const minutes = Number(interval)
+    if (!Number.isInteger(minutes) || minutes < 1) {
+      setValidation('Interval must be a whole number of minutes (1 or more).')
+      return
+    }
+    setLoading(true)
+    try {
+      const body = new FormData()
+      body.append('file', file)
+      body.append('interval_minutes', String(minutes))
+      if (webhook.trim()) body.append('webhook_url', webhook.trim())
+      if (name.trim()) body.append('name', name.trim())
+      const res = await fetch('/schedules', { method: 'POST', body })
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) {
+        setError(readError(payload, res.status))
+        return
+      }
+      const data: ScheduleDetail | undefined = payload?.data
+      if (!data) {
+        setError('Unexpected response from the server.')
+        return
+      }
+      // Reset the form and refresh the list so the new schedule appears.
+      setFile(null)
+      setName('')
+      setWebhook('')
+      if (inputRef.current) inputRef.current.value = ''
+      await loadSchedules()
+    } catch {
+      setError('Network error — is the server running?')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
-    <div
-      className="relative rounded-2xl border border-dashed border-gray-300 bg-gray-50/60 p-5 opacity-90"
-      data-testid={testid}
-      aria-disabled="true"
+    <section
+      aria-labelledby="schedule-heading"
+      className="mt-14 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm"
     >
       <div className="flex items-center justify-between">
-        <h3 className="text-base font-semibold text-gray-500">{title}</h3>
-        <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-800">
-          Coming soon
+        <h2 id="schedule-heading" className="text-lg font-semibold text-gray-900">
+          Schedule recurring runs
+        </h2>
+        <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-800">
+          Live
         </span>
       </div>
-      <p className="mt-2 text-sm text-gray-400">{description}</p>
-      <div className="mt-4 flex items-center gap-2">
-        <button
-          type="button"
-          disabled
-          className="cursor-not-allowed rounded-lg bg-gray-200 px-4 py-2 text-sm font-medium text-gray-400"
+      <p className="mt-1 text-sm text-gray-600">
+        Save a CSV and re-run the EDA analysis on a recurring cadence. Trigger a run
+        immediately with <span className="font-medium">Run now</span>, review the run
+        history, and optionally deliver a webhook after each run.
+      </p>
+
+      <form onSubmit={handleSubmit} className="mt-4">
+        <label className="block">
+          <span className="text-sm font-medium text-gray-700">CSV dataset</span>
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".csv,text/csv"
+            onChange={e => pickFile(e.target.files?.[0] ?? null)}
+            data-testid="schedule-file-input"
+            className="mt-1 block w-full cursor-pointer rounded-lg border border-gray-300 bg-white text-sm text-gray-700 shadow-sm file:mr-4 file:cursor-pointer file:border-0 file:bg-indigo-50 file:px-4 file:py-2.5 file:text-sm file:font-semibold file:text-indigo-700 hover:file:bg-indigo-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+        </label>
+
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <label className="block">
+            <span className="text-sm font-medium text-gray-700">Name (optional)</span>
+            <input
+              type="text"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder="Defaults to the filename"
+              data-testid="schedule-name-input"
+              className="mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-medium text-gray-700">Interval (minutes)</span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={interval}
+              onChange={e => setInterval(e.target.value)}
+              data-testid="schedule-interval-input"
+              className="mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+          </label>
+        </div>
+
+        <label className="mt-4 block">
+          <span className="text-sm font-medium text-gray-700">Webhook URL (optional)</span>
+          <input
+            type="url"
+            value={webhook}
+            onChange={e => setWebhook(e.target.value)}
+            placeholder="https://example.com/hook"
+            data-testid="schedule-webhook-input"
+            className="mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+        </label>
+
+        {validation && (
+          <p role="alert" className="mt-3 text-sm text-red-600">
+            {validation}
+          </p>
+        )}
+
+        <div className="mt-4 flex items-center gap-3">
+          <button
+            type="submit"
+            disabled={loading}
+            data-testid="schedule-submit"
+            className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading && (
+              <svg
+                className="h-4 w-4 animate-spin"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4z"
+                />
+              </svg>
+            )}
+            {loading ? 'Creating schedule…' : 'Create schedule'}
+          </button>
+          {file && !loading && (
+            <span className="text-xs text-gray-500">Ready: {file.name}</span>
+          )}
+        </div>
+      </form>
+
+      {/* Error card */}
+      {error && (
+        <div
+          role="alert"
+          className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-800"
         >
-          {title}
-        </button>
-        <span className="text-xs font-medium text-gray-400">{phase}</span>
+          <p className="font-semibold">Could not create schedule</p>
+          <p className="mt-1">{error}</p>
+        </div>
+      )}
+
+      {/* Schedules list */}
+      <div className="mt-8">
+        <div className="flex items-center justify-between">
+          <h3 className="text-base font-semibold text-gray-900">Your schedules</h3>
+          <button
+            type="button"
+            onClick={() => void loadSchedules()}
+            className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+          >
+            Refresh
+          </button>
+        </div>
+
+        {listError && (
+          <p role="alert" className="mt-3 text-sm text-red-600">
+            {listError}
+          </p>
+        )}
+
+        {listLoading ? (
+          <p className="mt-4 text-center text-sm text-gray-400">Loading schedules…</p>
+        ) : schedules.length === 0 ? (
+          <p
+            data-testid="schedule-empty"
+            className="mt-4 rounded-xl border border-dashed border-gray-300 bg-gray-50/60 py-8 text-center text-sm text-gray-400"
+          >
+            No schedules yet. Create one above to run EDA on a recurring cadence.
+          </p>
+        ) : (
+          <ul data-testid="schedule-list" className="mt-4 space-y-4">
+            {schedules.map(s => (
+              <ScheduleItem
+                key={s.schedule_id}
+                schedule={s}
+                onChanged={loadSchedules}
+              />
+            ))}
+          </ul>
+        )}
       </div>
-    </div>
+    </section>
+  )
+}
+
+function ScheduleItem({
+  schedule,
+  onChanged,
+}: {
+  schedule: ScheduleSummary
+  onChanged: () => Promise<void>
+}) {
+  const [runs, setRuns] = useState<ScheduleRunLink[] | null>(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [running, setRunning] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true)
+    setHistoryError(null)
+    try {
+      const res = await fetch(`/schedules/${schedule.schedule_id}`)
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) {
+        setHistoryError(readError(payload, res.status))
+        return
+      }
+      const data: ScheduleDetail | undefined = payload?.data
+      setRuns(Array.isArray(data?.runs) ? data.runs : [])
+    } catch {
+      setHistoryError('Network error — is the server running?')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [schedule.schedule_id])
+
+  // Load this schedule's run history once on mount so history is visible without
+  // an extra click, and stays fresh as the parent list re-renders.
+  useEffect(() => {
+    void loadHistory()
+  }, [loadHistory])
+
+  async function handleRunNow() {
+    setActionError(null)
+    setRunning(true)
+    try {
+      const res = await fetch(`/schedules/${schedule.schedule_id}/run`, {
+        method: 'POST',
+      })
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) {
+        setActionError(readError(payload, res.status))
+        return
+      }
+      // Refresh this schedule's history (new run at the top) and the parent list
+      // (last_run_at changed).
+      await loadHistory()
+      await onChanged()
+    } catch {
+      setActionError('Network error — is the server running?')
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  async function handleDelete() {
+    setActionError(null)
+    setDeleting(true)
+    try {
+      const res = await fetch(`/schedules/${schedule.schedule_id}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null)
+        setActionError(readError(payload, res.status))
+        setDeleting(false)
+        return
+      }
+      await onChanged()
+    } catch {
+      setActionError('Network error — is the server running?')
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <li
+      data-testid="schedule-item"
+      className="rounded-xl border border-gray-200 bg-gray-50/50 p-4"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <p className="truncate text-sm font-semibold text-gray-900">
+              {schedule.name}
+            </p>
+            <span
+              className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                schedule.active
+                  ? 'bg-emerald-100 text-emerald-800'
+                  : 'bg-gray-200 text-gray-600'
+              }`}
+            >
+              {schedule.active ? 'Active' : 'Paused'}
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-gray-500">
+            <span className="font-mono">{schedule.filename}</span> · every{' '}
+            {schedule.interval_minutes} min · last run{' '}
+            {formatTimestamp(schedule.last_run_at)}
+          </p>
+          {schedule.webhook_url && (
+            <p className="mt-0.5 truncate text-xs text-gray-400">
+              Webhook: {schedule.webhook_url}
+            </p>
+          )}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={handleRunNow}
+            disabled={running || deleting}
+            data-testid="schedule-run-now"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {running && (
+              <svg
+                className="h-3.5 w-3.5 animate-spin"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4z"
+                />
+              </svg>
+            )}
+            {running ? 'Running…' : 'Run now'}
+          </button>
+          <button
+            type="button"
+            onClick={handleDelete}
+            disabled={running || deleting}
+            data-testid="schedule-delete"
+            className="inline-flex items-center rounded-lg border border-gray-300 bg-white px-3.5 py-2 text-xs font-medium text-gray-700 shadow-sm transition hover:bg-red-50 hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {deleting ? 'Deleting…' : 'Delete'}
+          </button>
+        </div>
+      </div>
+
+      {actionError && (
+        <p role="alert" className="mt-3 text-xs text-red-600">
+          {actionError}
+        </p>
+      )}
+
+      {/* Run history */}
+      <div data-testid="schedule-run-history" className="mt-4 border-t border-gray-200 pt-3">
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            Run history
+          </p>
+          <button
+            type="button"
+            onClick={() => void loadHistory()}
+            disabled={historyLoading}
+            className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50"
+          >
+            {historyLoading ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
+
+        {historyError && (
+          <p role="alert" className="mt-2 text-xs text-red-600">
+            {historyError}
+          </p>
+        )}
+
+        {historyLoading && runs === null ? (
+          <p className="mt-2 text-xs text-gray-400">Loading run history…</p>
+        ) : runs && runs.length > 0 ? (
+          <ul className="mt-2 space-y-1.5">
+            {runs.map(run => (
+              <li
+                key={run.run_id}
+                data-testid="schedule-run"
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 text-xs shadow-sm"
+              >
+                <span className="flex items-center gap-2">
+                  <span
+                    className={`rounded-full px-2 py-0.5 font-semibold ${
+                      run.status === 'completed'
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-red-100 text-red-800'
+                    }`}
+                  >
+                    {run.status}
+                  </span>
+                  <span className="text-gray-500">
+                    {formatTimestamp(run.created_at)}
+                  </span>
+                </span>
+                {run.status === 'completed' && run.report_url ? (
+                  <a
+                    href={run.report_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    data-testid="schedule-run-report"
+                    className="font-medium text-indigo-600 hover:text-indigo-800"
+                  >
+                    Open report
+                  </a>
+                ) : (
+                  <span className="text-gray-400">No report</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-2 text-xs text-gray-400">
+            No runs yet. Click <span className="font-medium">Run now</span> to create one.
+          </p>
+        )}
+      </div>
+    </li>
   )
 }

@@ -12,6 +12,7 @@ from tools.training import (
     serialize_model,
     train_and_evaluate,
 )
+from graph.train_nodes import _metrics_summary
 
 
 def _classification_df(n: int = 120) -> pd.DataFrame:
@@ -151,3 +152,37 @@ def test_single_sample_class_raises():
     )
     with pytest.raises(ValueError):
         train_and_evaluate(df, "label", "auto")
+
+
+def test_metrics_summary_excludes_raw_rows():
+    """Privacy guard (spec PII rule): the Gemini insight prompt built by the
+    `summarize` node must contain ONLY aggregated metrics + column names —
+    never raw cell values. Mirrors the Phase-1 `narrate` prompt-spy.
+    """
+    n = 40
+    df = pd.DataFrame(
+        {
+            # Sentinel raw values that must NEVER reach the LLM prompt.
+            "feature_a": [f"SENTINELRAW{i}" for i in range(n)],
+            "feature_b": [1_000_000 + i for i in range(n)],
+            "label": (["low", "high"] * (n // 2)),
+        }
+    )
+    result = train_and_evaluate(df, "label", "auto")
+    state = {
+        "task_type": result["task_type"],
+        "algorithm": "auto",
+        "target_column": "label",
+        "feature_columns": result["feature_columns"],
+        "metrics": result["metrics"],
+    }
+    summary = _metrics_summary(state)
+
+    # Aggregates + column NAMES are allowed and present.
+    assert "Evaluation metrics" in summary
+    assert "feature_a" in summary and "feature_b" in summary
+
+    # No raw cell VALUE leaks into the prompt.
+    for i in range(n):
+        assert f"SENTINELRAW{i}" not in summary, f"raw categorical leaked: row {i}"
+        assert str(1_000_000 + i) not in summary, f"raw numeric leaked: row {i}"

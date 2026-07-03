@@ -365,3 +365,22 @@ training_ai = _build_graph()
 ```
 
 The `train_runner.py` mirrors `runner.py`: it inserts a pending `training_runs` row, invokes `training_ai` with the initial `TrainState`, and reconciles the final status. Training is otherwise deterministic and local — no worker queue, no node-level parallelism.
+
+---
+
+## Phase 3 — Scheduling (no new graph)
+
+Scheduled runs introduce **no new LangGraph graph and no new nodes**. A scheduled execution simply calls the existing EDA runner `run_agent(csv_bytes, filename)` (`src/graph/runner.py`), which invokes the unchanged `agentic_ai` EDA graph and creates a normal `runs` row. The only new machinery is an **in-process timer** that decides *when* to call `run_agent`, plus an optional webhook POST *after* it returns. The EDA and Train graphs above are untouched.
+
+**Scheduler component (`src/scheduling/scheduler.py`):**
+- Uses **APScheduler `BackgroundScheduler`** — a single module-level instance. NOT Celery/Redis/RQ; jobs run **in-process** in a background thread within the same uvicorn process, reusing the synchronous EDA pipeline. `apscheduler` is added to `pyproject.toml`.
+- **`start()`** — called once from the FastAPI lifespan (`src/api/__init__.py`) after `init_db()`; starts the `BackgroundScheduler`.
+- **`reregister_active()`** — called from the lifespan right after `start()`; loads every `active` `schedules` row from SQLite and adds an interval job for each (`trigger="interval", minutes=interval_minutes`, `id=schedule_id`, `replace_existing=True`). This is how schedule definitions survive a server restart. Missed fires while the process was down are **not** back-filled (documented limitation).
+- **`register(schedule)` / `unregister(schedule_id)`** — add/remove a job when a schedule is created (`POST /schedules`) or deleted (`DELETE /schedules/{id}`).
+- **`execute_schedule(schedule_id)`** — the job function each interval fires (and the same function **Run now** invokes synchronously). It: (1) loads the schedule's `csv_bytes` + `filename` from the DB, (2) calls `run_agent(csv_bytes, filename)` → new `runs.id`, (3) updates the schedule's `last_run_at` and links the run to the schedule (`runs.schedule_id`), (4) if `webhook_url` is set, POSTs `{schedule_id, run_id, status, report_url}` to it — **non-fatal**: any webhook error is caught and logged (`structlog`), the run is still recorded.
+
+**"Run now" vs interval firing:** both paths call the identical `execute_schedule` logic. **Run now** (`POST /schedules/{id}/run`) runs it **synchronously inside the HTTP request** (like `POST /runs`) and returns the created run, so the caller/gate sees the result immediately without waiting for the interval. Interval firing runs it on the `BackgroundScheduler` thread. Because `execute_schedule` reuses the fully-synchronous EDA pipeline and independent DB sessions per run, the two paths never share mutable state.
+
+**Concurrency note:** APScheduler's default job settings (`max_instances=1` per job, `coalesce=True`) prevent a slow EDA run from overlapping itself on the same schedule. Different schedules and ad-hoc `POST /runs` remain independent (independent `runs` rows, independent sessions), consistent with the Phase-1 concurrency model.
+
+**Observability:** each scheduled/Run-now execution logs `schedule_id`, resulting `run_id`, status, latency, and webhook delivery outcome via `structlog` to stdout — same structured-logging discipline as Phases 1–2. No LangSmith/OpenTelemetry added.

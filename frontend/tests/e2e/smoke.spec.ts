@@ -29,19 +29,21 @@ test('page loads, is styled, and shows the upload UI', async ({ page }) => {
   expect(bg).not.toBe('rgba(0, 0, 0, 0)')
 })
 
-test('the Schedule stub is labelled and disabled (Train is now live)', async ({ page }) => {
+test('Train and Schedule are both live — no "Coming soon" stubs remain', async ({ page }) => {
   await page.goto(APP)
 
-  // Schedule stays a labelled Phase-3 "Coming soon" stub.
-  const schedule = page.getByTestId('stub-schedule')
-  await expect(schedule).toBeVisible()
-  await expect(schedule.getByText('Coming soon')).toBeVisible()
-  await expect(schedule.getByRole('button')).toBeDisabled()
-
-  // Train is no longer a stub — it's a live panel with a working submit button.
+  // No labelled stubs remain after Phase 3.
   await expect(page.getByTestId('stub-train')).toHaveCount(0)
+  await expect(page.getByTestId('stub-schedule')).toHaveCount(0)
+  await expect(page.getByText('Coming soon')).toHaveCount(0)
+
+  // Train is a live panel with a working submit button.
   await expect(page.getByRole('heading', { name: 'Train a model' })).toBeVisible()
   await expect(page.getByTestId('train-submit')).toBeEnabled()
+
+  // Schedule is a live panel with a working create button.
+  await expect(page.getByRole('heading', { name: 'Schedule recurring runs' })).toBeVisible()
+  await expect(page.getByTestId('schedule-submit')).toBeEnabled()
 })
 
 test('upload a CSV, run EDA, and see the report + download button', async ({ page }) => {
@@ -99,4 +101,41 @@ test('train a model: upload labeled CSV, pick target, train, see metrics + downl
   await expect(download).toBeVisible()
   await expect(download).toHaveAttribute('download', '')
   await expect(download).toHaveAttribute('href', /\/train\/.+\/artifact/)
+})
+
+test('schedule journey: create a schedule, Run now, see a run with a report link', async ({
+  page,
+}) => {
+  await page.goto(APP)
+
+  // Create a schedule from a fixture CSV with an interval.
+  await page.getByTestId('schedule-file-input').setInputFiles(FIXTURE)
+  await page.getByTestId('schedule-name-input').fill('E2E schedule')
+  await page.getByTestId('schedule-interval-input').fill('60')
+  await page.getByTestId('schedule-submit').click()
+
+  // The new schedule appears in the list.
+  const list = page.getByTestId('schedule-list')
+  await expect(list).toBeVisible({ timeout: 30_000 })
+  const item = list.getByTestId('schedule-item').filter({ hasText: 'E2E schedule' }).first()
+  await expect(item).toBeVisible()
+  await expect(item).toContainText('every 60 min')
+
+  // Run now — synchronous EDA pipeline + LLM narrative; allow generous time.
+  await item.getByTestId('schedule-run-now').click()
+
+  // A completed run appears in this schedule's history with a report link.
+  const run = item.getByTestId('schedule-run-history').getByTestId('schedule-run').first()
+  await expect(run).toBeVisible({ timeout: 120_000 })
+  await expect(run).toContainText('completed')
+
+  const reportLink = run.getByTestId('schedule-run-report')
+  await expect(reportLink).toBeVisible()
+  await expect(reportLink).toHaveAttribute('href', /\/runs\/.+\/report/)
+})
+
+test('creating a schedule with no file shows inline validation', async ({ page }) => {
+  await page.goto(APP)
+  await page.getByTestId('schedule-submit').click()
+  await expect(page.getByText('Choose a CSV file to schedule first.')).toBeVisible()
 })

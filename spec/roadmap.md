@@ -34,8 +34,9 @@ Manual EDA is repetitive and error-prone: analysts write ad-hoc scripts to profi
 ## Key Constraints
 
 - Target dataset size: ≤ 50 MB (local, in-process). Larger datasets are deferred to future phases.
-- Privacy: CSVs may contain PII — the system never sends raw rows to the LLM; only derived aggregated summary statistics are sent to generate the narrative.
-- Runs execute **synchronously inside the HTTP request** — there is no worker queue in Phase 1.
+- Privacy: CSVs may contain PII — the system never sends raw rows to the LLM; only derived aggregated summary statistics are sent to generate the narrative. **This holds in Phase 3:** scheduled runs still send only aggregated stats to Gemini.
+- Runs execute **synchronously inside the HTTP request** — there is no worker queue in Phases 1–2. Phase 3 adds an **in-process** scheduler (APScheduler) that reuses the same synchronous EDA pipeline on a timer — still no external broker (no Celery/Redis/RQ).
+- **Raw-row persistence exception (Phase 3, opt-in only):** to re-run on a cadence a schedule must store the uploaded CSV bytes. This is the ONE deliberate exception to the "raw rows are never persisted" default, and it applies **only** to datasets a user explicitly attaches to a schedule. Ad-hoc `POST /runs` / `POST /train` uploads still never persist raw rows. The PII-to-LLM rule is unchanged in all cases (only aggregated stats reach Gemini). See [data.md](data.md).
 
 ## Phases of Development
 
@@ -115,12 +116,49 @@ The integration tests must exercise, against the real Gemini key: `POST /train` 
 
 **How the user tests it:** Run the gate command. Then (server launched via `uv run python -m src`) open `http://localhost:8001/app/`, and in the **Train panel** upload a labeled CSV (e.g. `tests/fixtures/train_classification.csv`), pick a target column, pick an algorithm (or leave **Auto**), and submit. See the evaluation metrics render plus a **Download model** button that downloads a `.joblib` artifact. The "Schedule runs" section remains a visible "Coming soon" stub (real-on-path: Train + metrics + download; labelled stub: Schedule).
 
-### Phase 3 — Scheduling & Delivery (future)
+### Phase 3 — Scheduling & Delivery (ACTIVE)
 
-**Goal:** Saved pipelines, scheduled runs, and report delivery (webhook/email), plus basic auth/RBAC.
+**Goal:** Let a user create a **schedule** that re-runs an **EDA analysis** on a stored dataset on a recurring cadence, see the resulting **run history**, trigger a **Run now**, and optionally receive **delivery** via a webhook. This wires the currently-stubbed "Schedule runs" tile into real functionality. The EDA and Train flows from Phases 1–2 are unchanged.
 
-- Adds: scheduler, notifications, auth surface (JWT/API key), run cancel, and URL-based ingest.
-- Stack note: scheduling and delivery may introduce a background scheduler and (optionally) Postgres/object storage — evaluated when the phase is scoped, not assumed now.
-- Gate command: `uv run pytest tests/integration/test_scheduler.py -v`.
+A **schedule** stores an uploaded CSV plus a cadence (`interval_minutes`) and an optional `webhook_url`. An **in-process APScheduler `BackgroundScheduler`** — started in the FastAPI lifespan ([architecture.md](architecture.md), [agent.md](agent.md)) — fires each active schedule on its interval, reusing the existing synchronous EDA pipeline (`run_agent` in `src/graph/runner.py`) to create a normal `runs` row. A **Run now** endpoint executes a schedule immediately (no waiting for the interval) so a human — and the gate — can test end-to-end in seconds. After each scheduled/Run-now execution completes, if the schedule has a `webhook_url`, a small JSON payload (schedule id, run id, status, report_url) is POSTed to it; webhook failure is **non-fatal** (logged, execution still recorded).
 
-> **Assumed:** Phase 3 is directional only; its slices, entities, and any heavier infrastructure are finalized when it is scoped. Phases 1–2 introduce no Postgres, Redis, Celery/RQ, S3, or auth. Phase 2 is scoped and active (see above).
+**Key constraints locked for this phase:**
+- **In-process, no broker.** APScheduler `BackgroundScheduler` in the app lifespan — NOT Celery/Redis/RQ. Jobs run in the same process, synchronously reusing the EDA pipeline. Honest limitation: schedules only fire while the server process is running; on startup all `active` schedules are **re-registered** from the DB (persistence of the schedule definition survives restarts, but missed fires while the process was down are not back-filled).
+- **Opt-in dataset persistence.** The schedule's CSV bytes are stored inline (`schedules.csv_bytes` BLOB) so the pipeline can re-run without re-upload — the deliberate, scoped exception documented in Key Constraints and [data.md](data.md). Still only aggregated stats reach Gemini.
+- **Cadence = `interval_minutes`** (primary, testable). A `cron` string is **out of scope** for this phase (deferred — see Phase 4).
+- **Auth/RBAC = OUT OF SCOPE** for Phase 3 — stays no-auth, consistent with Phases 1–2 (deferred to Phase 4).
+
+**Independent slices** (disjoint file paths, fully parallel):
+
+- **`backend-scheduling`** (backend) — owns all new/changed files under `src/` (except the frontend) + backend tests + fixture. Deps: none. Owns:
+  - `pyproject.toml` (add the `apscheduler` dependency).
+  - `src/scheduling/scheduler.py` — a module owning the `BackgroundScheduler` singleton: `start()` (called from lifespan), `register(schedule)`, `unregister(schedule_id)`, `reregister_active()` (re-adds all `active` schedules from the DB on startup), and `execute_schedule(schedule_id)` (loads the schedule's CSV bytes, calls `run_agent`, updates `last_run_at`, POSTs the webhook if set). This is the ONE new touch to `src/api/__init__.py`'s lifespan (add `scheduler.start()` + `reregister_active()` after `init_db()`).
+  - `src/api/schedules.py` — new router (`POST /schedules`, `GET /schedules`, `GET /schedules/{id}`, `POST /schedules/{id}/run`, `DELETE /schedules/{id}`) registered in `src/api/__init__.py`.
+  - `src/db/models.py` — add the `ScheduleRow` model → `schedules` table (see [data.md](data.md)).
+  - `src/domain/schedule.py` — `ScheduleResponse` / `ScheduleDetailResponse` pydantic models.
+  - Tests: `tests/integration/test_scheduling.py`; fixture reuses an existing `tests/fixtures/*.csv`.
+  - **Note the one shared file with the frontend slice: none.** The lifespan edit and router registration in `src/api/__init__.py` are owned entirely by this slice; the frontend slice never touches `src/`.
+- **`frontend-schedule`** (frontend) — owns everything under `frontend/`. Deps: builds against the [api.md](api.md) contract; its live Playwright e2e test depends on the backend only at gate time. Owns:
+  - `frontend/src/app/page.tsx` — replace the "Schedule runs" `ComingSoon` tile with a **real Schedule panel**: a create-schedule form (CSV file + `interval_minutes` + optional `webhook_url` + optional `name`), a **schedules list**, a per-schedule expandable **run history** (the schedule's `runs`, each linking to its report), a **Run now** button, and a **Delete** button. No labelled stubs remain after Phase 3 — the Train and Schedule tiles are both real.
+  - `frontend/tests/e2e/*` — a Playwright test covering the schedule journey: create a schedule on a fixture CSV, click **Run now**, assert a run appears in the schedule's history with a viewable report link. (Interval-based firing is not asserted in e2e — Run now is the deterministic path.)
+
+**Key surfaces / files:** `pyproject.toml`, `src/scheduling/scheduler.py`, `src/api/schedules.py`, `src/api/__init__.py`, `src/db/models.py`, `src/domain/schedule.py`, `frontend/src/app/page.tsx`, `tests/integration/test_scheduling.py`.
+
+**Gate command:** `uv run pytest tests/integration/test_scheduling.py -v` — and the full suite must stay green (`uv run pytest -v`).
+
+The integration tests must exercise, against the real Gemini key (the scheduled EDA run reuses the real narrate node): `POST /schedules` with a fixture CSV + `interval_minutes` → status object with a new `schedule_id`, `active=true`, empty run history; `GET /schedules` lists it; `POST /schedules/{id}/run` (**Run now**) synchronously creates a `runs` row and returns it → `GET /schedules/{id}` now shows that run in its history with status `completed` and a `report_url`, and `GET /runs/{run_id}/report` returns the HTML; `DELETE /schedules/{id}` removes it (`GET /schedules/{id}` → 404) and unregisters its job; plus a **webhook** case: create a schedule with a `webhook_url` pointing at a local capture endpoint (a lightweight test HTTP server / `pytest-httpserver`-style stub or a captured `POST /schedules/{id}/run` follow-up), Run now, assert the webhook received a payload with `schedule_id`, `run_id`, `status`, `report_url`; plus a **webhook-failure-is-non-fatal** case (unreachable `webhook_url` → the run still records `completed`); plus error cases: `POST /schedules` with no file (400), non-CSV (400), empty CSV (400), missing/invalid `interval_minutes` (400), and `GET`/`POST run`/`DELETE` on an unknown `schedule_id` (404).
+
+> The webhook capture in the gate uses a real local HTTP listener (not a mock of the POST call) so the delivery path is genuinely exercised over the wire.
+
+**Frontend slice gate:** `cd frontend && pnpm exec playwright test` — the `frontend/tests/e2e/` schedule test runs against the running app (`uv run python -m src` on port 8001) and asserts the create-schedule → Run now → run-appears-in-history → report-link journey.
+
+**How the user tests it:** Run the gate command. Then (server launched via `uv run python -m src`) open `http://localhost:8001/app/`, and in the **Schedule panel** create a schedule from a fixture CSV (e.g. `tests/fixtures/*.csv`) with an interval of a few minutes and (optionally) a `webhook_url`. Click **Run now** — within seconds a run appears in that schedule's **run history** with a link that opens the same self-contained EDA report as Phase 1; if a webhook was set, the receiver gets a JSON payload. Leave the app running and the schedule re-fires on its interval, appending further runs to history. Use **Delete** to remove the schedule. Everything on this page is now real (no "Coming soon" stubs remain).
+
+### Phase 4 — Cron cadence, auth & richer delivery (deferred)
+
+**Goal:** production-hardening on top of the Phase 3 scheduler.
+
+- Adds: cron-string cadence (alongside `interval_minutes`), auth/RBAC (JWT/API key), email/Slack delivery, run cancel, URL-based ingest, and (if load justifies) durable scheduling / a broker.
+- Gate command (indicative): `uv run pytest tests/integration/test_phase4.py -v`.
+
+> **Assumed:** Phase 4 is directional only; its slices, entities, and any heavier infrastructure are finalized when it is scoped. Phases 1–3 introduce no Postgres, Redis, Celery/RQ, S3, or auth. Phases 2 and 3 are scoped and active (see above).

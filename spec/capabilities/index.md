@@ -13,9 +13,10 @@ A capability is a single, discrete action the agent performs.
 | Capability | File | Phase |
 |-----------|------|-------|
 | Profile dataset (EDA + report) | [profile.md](profile.md) | 1 |
-| Train model | [train.md](train.md) | 2 (deferred) |
+| Train model | [train.md](train.md) | 2 |
+| Schedule EDA runs & delivery | [schedule.md](schedule.md) | 3 |
 
-> Report rendering is part of the Phase 1 `profile` capability (the EDA run produces the self-contained HTML report), so it is not a separate capability file.
+> Report rendering is part of the Phase 1 `profile` capability (the EDA run produces the self-contained HTML report), so it is not a separate capability file. The Phase 3 `schedule` capability reuses that same EDA pipeline on a timer — it adds no new agent graph.
 
 ## How to Add a New Capability
 
