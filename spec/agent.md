@@ -115,10 +115,6 @@ class AgentState(TypedDict, total=False):
 **External calls:** `render_report_html` tool (pure)
 **Behaviour:** Assembles a single self-contained HTML document (stats table, missingness table, sample-rows table, 3 embedded charts, narrative). No external I/O.
 
-### `train` (Phase 2 — deferred stub)
-
-Not wired in Phase 1. In Phase 2 this node will train a scikit-learn model on a labeled CSV and persist a `ModelArtifact`. Documented here so the graph can be extended without restructuring.
-
 ### `handle_error`
 
 Sets `status="failed"`, keeps `error`, and logs context (structlog). Terminal.
@@ -231,3 +227,141 @@ def _build_graph():
 
 agentic_ai = _build_graph()
 ```
+
+---
+
+## Phase 2 — Training Graph (dedicated `StateGraph`)
+
+Model training uses a **second, separate LangGraph `StateGraph`**, mirroring the Phase-1 EDA structure but fully independent (its own state, nodes, runner, and DB table `training_runs`). It runs **synchronously inside the HTTP request** and is **deterministic/local** — scikit-learn does the work; the only LLM call is the non-fatal `summarize` step (analogous to `narrate` in the EDA graph). The EDA graph above is unchanged.
+
+**Files:** `src/graph/train_state.py`, `src/graph/train_nodes.py`, `src/graph/train_agent.py`, `src/graph/train_runner.py`, `src/tools/training.py` (pure functions), `src/prompts/train_insight.md`.
+
+### Training State (`src/graph/train_state.py`)
+
+```python
+class TrainState(TypedDict, total=False):
+    # Identity
+    train_id: str                   # set at initialisation (training_runs.id)
+
+    # Input
+    filename: str                   # original uploaded filename
+    csv_bytes: bytes                # raw uploaded CSV, held in memory only
+    target_column: str              # label column selected by the user
+    algorithm: str                  # requested: "auto" | "logistic_regression" | "random_forest"
+
+    # Pipeline data (populated progressively by nodes)
+    task_type: str                  # "classification" | "regression" (detected)
+    dataframe: object               # parsed pandas DataFrame (in-process only)
+    model: object                   # fitted scikit-learn Pipeline
+    feature_columns: list           # feature column names
+    metrics: dict                   # evaluation metrics
+    artifact_bytes: bytes           # joblib.dump(pipeline) bytes
+
+    # Output
+    insight: str | None             # Gemini metrics summary, or templated fallback
+
+    # Control
+    status: str                     # "pending" | "completed" | "failed"
+    error: str | None               # set by any node on fatal failure
+```
+
+### Nodes / Steps
+
+#### `ingest_train`
+**Reads:** `csv_bytes`, `target_column`. **Writes:** `dataframe`, may set `error`. **LLM:** no.
+Parses the CSV into a pandas DataFrame and validates it (parseable, non-empty; `target_column` must exist as a column; enough rows to train after dropping missing-target rows). Fatal on failure (set `error` → `handle_error`).
+
+#### `train`
+**Reads:** `dataframe`, `target_column`, `algorithm`. **Writes:** `task_type`, `model`, `feature_columns`, may set `error`. **LLM:** no.
+Detects the task type deterministically, builds the preprocessing + estimator `Pipeline`, splits, and fits. Fatal on failure.
+
+- **Task detection:** non-numeric target → `classification`. Numeric target: if integer-like AND unique-value count ≤ `max(20, 5% of rows)` → `classification`; else `regression`.
+- **Algorithm mapping** (from requested `algorithm`):
+  - classification: `logistic_regression` → `LogisticRegression(max_iter=1000)`; `random_forest` → `RandomForestClassifier`; `auto` → `RandomForestClassifier`.
+  - regression: `logistic_regression` → `LinearRegression` (linear counterpart); `random_forest` → `RandomForestRegressor`; `auto` → `RandomForestRegressor`.
+- **Preprocessing (`ColumnTransformer` inside the `Pipeline`, so the artifact predicts on raw-like rows):** drop rows with missing target; features = all columns except target; numeric → `SimpleImputer(strategy="median")` (+ `StandardScaler` for linear/logistic models only); categorical → `SimpleImputer(strategy="most_frequent")` + `OneHotEncoder(handle_unknown="ignore")`.
+- **Split:** `train_test_split(test_size=0.25, random_state=42)`; `stratify=y` for classification when every class has ≥2 samples, else no stratify.
+
+#### `evaluate`
+**Reads:** `model`, `task_type`, test split. **Writes:** `metrics`, `artifact_bytes`, may set `error`. **LLM:** no.
+Computes metrics on the held-out test set and serializes the fitted `Pipeline` to joblib bytes.
+
+- classification metrics: `accuracy`, `f1` (weighted), `precision` (weighted), `recall` (weighted), `n_classes`, `classes`, `n_test`.
+- regression metrics: `r2`, `mae`, `rmse`, `n_test`.
+- `artifact_bytes` = `joblib.dump(pipeline)` to an in-memory buffer. Fatal on failure.
+
+#### `summarize`
+**Reads:** `metrics`, `feature_columns`, `target_column`, `task_type`, `algorithm`. **Writes:** `insight` (never sets `error`). **LLM:** yes — Gemini `gemini-2.5-flash`.
+The **one non-fatal** step (mirrors `narrate`). Sends **only aggregated metrics + column/feature names** to Gemini (PII rule — never cell values) to produce a short plain-text insight. On any Gemini failure (error, timeout, empty) it falls back to a **templated insight** built from the same metrics and continues. System prompt in `src/prompts/train_insight.md`.
+
+#### `persist`
+**Reads:** all output fields. **Writes:** `status`. **LLM:** no.
+Writes the `training_runs` row (status, filename, target_column, algorithm, task_type, metrics JSON, feature_columns JSON, `artifact` BLOB, n_rows, n_features, insight, error). Sets `status="completed"`. (In the runner, persistence may also be performed after `invoke`, matching the Phase-1 `run_agent` pattern; the node is the canonical write point.)
+
+#### `handle_error`
+Sets `status="failed"`, preserves `error`, logs context (structlog). Terminal. Reuses the same pattern as the EDA graph (a separate handler in the train graph).
+
+### Graph / Flow Topology
+
+```
+START
+  │
+  ▼
+ingest_train ──(error)──► handle_error ──► END
+  │
+  ▼
+train ──(error)──► handle_error ──► END
+  │
+  ▼
+evaluate ──(error)──► handle_error ──► END
+  │
+  ▼
+summarize ──► persist ──► END
+```
+
+**Conditional edges:** `ingest_train`, `train`, and `evaluate` each route to `handle_error` when `state.get("error")` is set, otherwise to the next node. `summarize → persist` and `persist → END` are unconditional — the Gemini failure inside `summarize` does NOT set `error` (templated fallback), so the flow always reaches `persist`.
+
+### Graph Assembly (`src/graph/train_agent.py`)
+
+```python
+from langgraph.graph import StateGraph, END
+
+from graph.train_state import TrainState
+from graph.train_nodes import (
+    ingest_train, train, evaluate, summarize, persist, handle_error,
+)
+from graph.train_nodes import after_ingest_train, after_train, after_evaluate
+
+
+def _build_graph() -> StateGraph:
+    g = StateGraph(TrainState)
+    g.add_node("ingest_train", ingest_train)
+    g.add_node("train", train)
+    g.add_node("evaluate", evaluate)
+    g.add_node("summarize", summarize)
+    g.add_node("persist", persist)
+    g.add_node("handle_error", handle_error)
+
+    g.set_entry_point("ingest_train")
+    g.add_conditional_edges(
+        "ingest_train", after_ingest_train,
+        {"train": "train", "handle_error": "handle_error"},
+    )
+    g.add_conditional_edges(
+        "train", after_train,
+        {"evaluate": "evaluate", "handle_error": "handle_error"},
+    )
+    g.add_conditional_edges(
+        "evaluate", after_evaluate,
+        {"summarize": "summarize", "handle_error": "handle_error"},
+    )
+    g.add_edge("summarize", "persist")
+    g.add_edge("persist", END)
+    g.add_edge("handle_error", END)
+    return g.compile()
+
+
+training_ai = _build_graph()
+```
+
+The `train_runner.py` mirrors `runner.py`: it inserts a pending `training_runs` row, invokes `training_ai` with the initial `TrainState`, and reconciles the final status. Training is otherwise deterministic and local — no worker queue, no node-level parallelism.

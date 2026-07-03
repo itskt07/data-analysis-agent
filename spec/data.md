@@ -27,30 +27,46 @@ Represents a single user-initiated EDA run. (Extends the skeleton's `RunRow`.)
 
 > The skeleton's existing `input_text` / `output_text` columns are repurposed/replaced by `filename`, `narrative`, and `report_html` for the EDA capability.
 
-### Entity: ModelArtifact (Phase 2 — deferred)
+### Entity: TrainingRun (Phase 2)
 
-Metadata about trained models. Not created in Phase 1.
+Represents a single user-initiated model-training run. Stored in its own table `training_runs`, **separate from `runs`** (the training flow has a dedicated graph mirroring the EDA flow). The trained model artifact (a joblib-serialized scikit-learn `Pipeline`) is stored **inline in the DB as a BLOB** — consistent with the Phase-1 inline-report decision (no filesystem/object store).
+
+Table `training_runs`:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| id | text (UUID) | yes | Artifact id |
-| run_id | text (UUID) | yes | Linking run |
-| path | text | yes | Artifact path/location |
-| metrics | json | no | Evaluation metrics |
-| created_at | timestamp | yes | When produced |
+| id | text (UUID) | yes | Primary key (`train_id`) |
+| status | text (enum) | yes | `pending`, `completed`, `failed` |
+| filename | text | no | Original uploaded CSV filename |
+| target_column | text | yes | The label column selected by the user |
+| algorithm | text | yes | Requested algorithm: `auto`, `logistic_regression`, `random_forest` |
+| task_type | text (enum) | no | Detected task: `classification` or `regression` (null on early failure) |
+| metrics | text (JSON) | no | Evaluation metrics, serialized as a JSON string |
+| feature_columns | text (JSON) | no | Feature column names used, serialized as a JSON string |
+| artifact | blob (LargeBinary) | no | joblib-serialized fitted `Pipeline` bytes (null on failure) |
+| n_rows | integer | no | Number of rows used after dropping missing-target rows |
+| n_features | integer | no | Number of feature columns |
+| insight | text | no | Gemini metrics summary, or the templated fallback |
+| error_message | text | no | Set when `status = failed` |
+| created_at | timestamp | yes | Creation time |
+| updated_at | timestamp | yes | Last update time |
+
+Tables are still auto-created at startup via `Base.metadata.create_all` (`init_db()`); no Alembic migration step.
+
+> **Assumed:** the joblib model artifact is stored inline in the `artifact` LargeBinary/BLOB column (never on a filesystem/object store) — consistent with the Phase-1 inline-report decision, keeping the project free of any artifact-store dependency.
 
 ## Relationships
 
-- `Run` 1:N `ModelArtifact` — deferred to Phase 2 (a Phase-2 run may produce a model artifact).
+- `Run` (EDA) and `TrainingRun` (training) are **independent** — training is a separate flow with its own table and graph. There is no foreign-key link in Phase 2 (a training run is initiated by its own CSV upload, not derived from an EDA run).
 
 ## Data Lifecycle
 
-- The uploaded CSV lives on a temporary local path only during the synchronous run, then is discarded.
-- The `Run` row (including `report_html`) persists in SQLite until deleted. No automatic retention policy in Phase 1.
+- The uploaded CSV lives in memory only during the synchronous run, then is discarded (both EDA and training).
+- The `Run` row (including `report_html`) and the `TrainingRun` row (including the joblib `artifact` BLOB) persist in SQLite until deleted. No automatic retention policy.
 
 ## Sensitive Data
 
 - CSVs may contain PII. The system:
-  - Never sends raw rows to the LLM — only derived, aggregated statistics.
-  - Never persists raw rows in the database.
-  - Logs no raw cell values (only aggregate counts/metadata).
+  - Never sends raw rows to the LLM — only derived, aggregated statistics (EDA) or aggregated metrics + column/feature names (training).
+  - Never persists raw rows in the database. The training `artifact` BLOB is a serialized model `Pipeline` (learned parameters), not raw rows.
+  - Logs no raw cell values (only aggregate counts/metadata/metrics).

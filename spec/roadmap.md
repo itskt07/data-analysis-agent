@@ -78,14 +78,42 @@ The integration tests must exercise, against the real Gemini key: upload a fixtu
 
 **How the user tests it:** Run the gate command. Then (server launched by the orchestrator via `uv run python -m src`) open `http://localhost:8001/app/`, upload a file from `tests/fixtures/*.csv`, and see the rendered EDA report with the stats tables and 3 charts plus the narrative, with a download button. The "Train a model" and "Schedule runs" sections are visibly "Coming soon" stubs (real-on-path: upload + report + download; labelled stubs: Train, Schedule).
 
-### Phase 2 — Model Training & Evaluation (future)
+### Phase 2 — Model Training & Evaluation (ACTIVE)
 
-**Goal:** A simple Train flow that trains a scikit-learn model (logistic regression / random forest) on a labeled CSV, shows evaluation metrics, and provides a downloadable model artifact.
+**Goal:** Upload a labeled CSV + pick a target column → train a scikit-learn model → show evaluation metrics → download a joblib model artifact. This wires the currently-stubbed "Train a model" tile into real functionality. "Schedule runs" stays a labelled Phase-3 stub.
 
-- Slices (indicative): `trainer` (backend training node + metrics + artifact persistence), `train-api` (endpoints), `frontend-train` (label-column + algorithm selection UI, results view).
-- Adds: `ModelArtifact` entity, `train` graph node (currently deferred/stub), `POST /runs` gains a train action.
-- Stack note: still synchronous + SQLite for small datasets. A worker queue (e.g. Celery/RQ + Redis) is an **option** if training times grow, not a given.
-- Gate command: `uv run pytest tests/integration/test_training.py -v`.
+The Train flow is a **separate deterministic graph** from the EDA graph, mirroring the Phase-1 structure (its own `TrainState`, nodes, runner, and DB table `training_runs`). Training is deterministic and local (scikit-learn); the only LLM call is a non-fatal `summarize` step that turns aggregated metrics into a short insight (templated fallback on failure) — see [agent.md](agent.md). Still synchronous + SQLite; no worker queue.
+
+- **Task detection (deterministic):** non-numeric target → classification; numeric target → classification if integer-like AND unique-value count ≤ `max(20, 5% of rows)`, else regression.
+- **Algorithms** (form field `algorithm`, default `auto`): classification → `logistic_regression`=LogisticRegression, `random_forest`=RandomForestClassifier, `auto`=random_forest; regression → `logistic_regression`=LinearRegression, `random_forest`=RandomForestRegressor, `auto`=random_forest.
+- **Metrics:** classification → accuracy, f1 (weighted), precision (weighted), recall (weighted), n_classes, classes, n_test; regression → r2, mae, rmse, n_test.
+- **Artifact:** the fitted sklearn `Pipeline` (preprocessing + estimator) is joblib-serialized and stored inline as a BLOB in `training_runs`, downloadable via `GET /train/{id}/artifact` (see [api.md](api.md), [data.md](data.md)).
+- **Privacy (unchanged):** the `summarize` (Gemini) node receives ONLY aggregated metrics + column/feature names — never raw cell values.
+
+**Independent slices** (disjoint file paths, fully parallel):
+
+- **`backend-train`** (backend) — Deps: none. Owns:
+  - `pyproject.toml` (add `scikit-learn` and `joblib` deps).
+  - `src/tools/training.py` (pure functions: task detection, pipeline building, fit, metrics, joblib serialization).
+  - `src/graph/train_state.py`, `src/graph/train_nodes.py`, `src/graph/train_agent.py`, `src/graph/train_runner.py`.
+  - `src/db/models.py` (add the `TrainingRun` model → `training_runs` table).
+  - `src/domain/training.py` (new `TrainResponse` pydantic model).
+  - `src/api/train.py` (new router) + register it in `src/api/__init__.py`.
+  - `src/prompts/train_insight.md` (Gemini system prompt for the metrics insight).
+  - Tests: `tests/unit/test_training_tools.py`, `tests/integration/test_training.py`; fixtures `tests/fixtures/train_classification.csv`, `tests/fixtures/train_regression.csv`.
+- **`frontend-train`** (frontend) — Deps: builds against the [api.md](api.md) contract; its live Playwright e2e test depends on the backend only at gate time. Owns:
+  - `frontend/src/app/page.tsx` — replace the "Train a model" `ComingSoon` tile with a **real Train panel** (file upload + target-column input + algorithm select `Auto`/`Logistic Regression`/`Random Forest` + submit → metrics view + a Download model button hitting `artifact_url`). Keep the "Schedule runs" tile as a labelled `ComingSoon` stub.
+  - `frontend/tests/e2e/*` — a Playwright test covering the train journey (upload a labeled CSV, pick a target column, submit, assert metrics render + Download model button appears; assert "Schedule runs" is still "Coming soon").
+
+**Key surfaces / files:** `src/tools/training.py`, `src/graph/train_state.py`, `src/graph/train_nodes.py`, `src/graph/train_agent.py`, `src/graph/train_runner.py`, `src/db/models.py`, `src/domain/training.py`, `src/api/train.py`, `src/api/__init__.py`, `src/prompts/train_insight.md`, `frontend/src/app/page.tsx`, `tests/unit/test_training_tools.py`, `tests/integration/test_training.py`, `tests/fixtures/train_*.csv`.
+
+**Gate command:** `uv run pytest tests/integration/test_training.py -v` — and the full suite must stay green (`uv run pytest -v`).
+
+The integration tests must exercise, against the real Gemini key: `POST /train` with `train_classification.csv` (a target column with several classes) → status `completed`, `task_type=classification`, metrics include accuracy/f1/precision/recall, `artifact_url` set, and `GET /train/{id}/artifact` returns downloadable joblib bytes; `POST /train` with `train_regression.csv` (continuous target) → `task_type=regression`, metrics include r2/mae/rmse; plus error cases: missing `target_column` (400), `target_column` not in the CSV (400), non-CSV (400), empty CSV (400), too few rows to train (400), unknown `train_id` (404). Each fixture must have enough rows that the 0.75/0.25 train/test split yields a non-trivial test set (≥ ~40 rows) so metrics are meaningful, not degenerate.
+
+**Frontend slice gate:** `cd frontend && pnpm exec playwright test` — the `frontend/tests/e2e/` train test runs against the running app (`uv run python -m src` on port 8001) and asserts the upload → target-column → train → metrics → Download model journey plus the labelled "Schedule runs — Coming soon" stub.
+
+**How the user tests it:** Run the gate command. Then (server launched via `uv run python -m src`) open `http://localhost:8001/app/`, and in the **Train panel** upload a labeled CSV (e.g. `tests/fixtures/train_classification.csv`), pick a target column, pick an algorithm (or leave **Auto**), and submit. See the evaluation metrics render plus a **Download model** button that downloads a `.joblib` artifact. The "Schedule runs" section remains a visible "Coming soon" stub (real-on-path: Train + metrics + download; labelled stub: Schedule).
 
 ### Phase 3 — Scheduling & Delivery (future)
 
@@ -95,4 +123,4 @@ The integration tests must exercise, against the real Gemini key: upload a fixtu
 - Stack note: scheduling and delivery may introduce a background scheduler and (optionally) Postgres/object storage — evaluated when the phase is scoped, not assumed now.
 - Gate command: `uv run pytest tests/integration/test_scheduler.py -v`.
 
-> **Assumed:** Phases 2–3 are directional only; their slices, entities, and any heavier infrastructure are finalized when each phase is scoped. Phase 1 introduces no Postgres, Redis, Celery/RQ, S3, or auth.
+> **Assumed:** Phase 3 is directional only; its slices, entities, and any heavier infrastructure are finalized when it is scoped. Phases 1–2 introduce no Postgres, Redis, Celery/RQ, S3, or auth. Phase 2 is scoped and active (see above).
