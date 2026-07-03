@@ -8,11 +8,27 @@ _engine: Engine | None = None
 _SessionLocal: sessionmaker | None = None
 
 
+def _ensure_sqlite_dir(database_url: str) -> None:
+    """SQLite won't create a missing parent directory; ensure it exists."""
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return
+    path = database_url[len(prefix):]
+    if not path or path == ":memory:":
+        return
+    from pathlib import Path
+    parent = Path(path).parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+
+
 def _get_engine() -> Engine:
     global _engine
     if _engine is None:
         from config.settings import get_settings
-        _engine = create_engine(get_settings().database_url, echo=False)
+        database_url = get_settings().database_url
+        _ensure_sqlite_dir(database_url)
+        _engine = create_engine(database_url, echo=False)
     return _engine
 
 

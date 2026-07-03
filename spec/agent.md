@@ -6,7 +6,7 @@ This project uses a small pipeline-style agent built on **LangGraph** (`langgrap
 
 ## Agent Architecture Pattern
 
-**Chosen:** Graph pipeline (LangGraph `StateGraph`) — a linear multi-step flow (`ingest → profile → render_report`) with a conditional error edge. Rationale: clean separation between ingesting, profiling, and rendering makes each step independently testable, and the conditional edge routes any failure to a single `handle_error` node.
+**Chosen:** Graph pipeline (LangGraph `StateGraph`) — a linear multi-step flow (`ingest → profile → narrate → render_report`) with a conditional error edge. Rationale: clean separation between ingesting, profiling (stats + charts), narrating (the single LLM step), and rendering makes each step independently testable, and the conditional edge routes any fatal failure to a single `handle_error` node.
 
 ---
 
@@ -14,7 +14,7 @@ This project uses a small pipeline-style agent built on **LangGraph** (`langgrap
 
 | Agent / Node | Provider | Model ID | Rationale |
 |-------------|----------|----------|-----------|
-| `profile` (narrative sub-step) | Google Gemini | `gemini-2.5-flash` | Fast, low-cost summary generation; the only LLM use in the pipeline |
+| `narrate` | Google Gemini | `gemini-2.5-flash` | Fast, low-cost summary generation; the only LLM use in the pipeline |
 
 - Gemini is the **only** provider. Provider auto-detects from `AGENT_GEMINI_API_KEY`. Accessed via `LLMClient().call_model(prompt, system=None)`.
 - The LLM is used **only** to turn derived, aggregated statistics into a human-readable narrative. It **never** receives raw dataset rows (PII rule).
@@ -27,7 +27,7 @@ This project uses a small pipeline-style agent built on **LangGraph** (`langgrap
 
 ## Tools & Tool Calling
 
-Tools are **pure functions** under `src/tools/`, invoked deterministically by the `profile`/`render_report` nodes (not LLM-selected).
+Tools are **pure functions** under `src/tools/`, invoked deterministically by the `profile`/`narrate`/`render_report` nodes (not LLM-selected).
 
 | Tool | Description | Inputs | Output | Side-effects |
 |------|-------------|--------|--------|--------------|
@@ -83,21 +83,33 @@ class AgentState(TypedDict, total=False):
 
 ### `profile`
 
-**Reads from state:** the ingested DataFrame, `input_path`
-**Writes to state:** `profile`, `narrative`, `status`, may set `error`
-**LLM call:** yes — Gemini `gemini-2.5-flash`, derived aggregated stats only, plain-text output
+**Reads from state:** the ingested DataFrame
+**Writes to state:** `profile`, `charts`, may set `error`
+**LLM call:** no
 **External calls:**
 
 | System | Operation | On Failure |
 |--------|-----------|------------|
-| `profile_dataframe`, `render_charts` tools | Compute stats + render 3 charts | fatal (set `error`) |
-| Gemini | Generate narrative from derived stats | partial — fall back to templated narrative, continue |
+| `profile_dataframe`, `render_charts` tools | Compute derived stats + render 3 charts | fatal (set `error`) |
 
-**Behaviour:** Computes summary stats, missingness, sample rows, and renders the histogram/boxplot/correlation-heatmap charts (base64 PNG). Then calls Gemini with the derived stats to produce the narrative; on Gemini failure it builds a templated narrative and continues.
+**Behaviour:** Computes summary stats, missingness, and sample rows, and renders the histogram/boxplot/correlation-heatmap charts (base64 PNG). Pure/deterministic — no LLM call here. Routes to `narrate` on success, `handle_error` on failure.
+
+### `narrate`
+
+**Reads from state:** `profile`
+**Writes to state:** `narrative` (never sets `error`)
+**LLM call:** yes — Gemini `gemini-2.5-flash`, derived aggregated stats only (via `build_stats_summary`), plain-text output
+**External calls:**
+
+| System | Operation | On Failure |
+|--------|-----------|------------|
+| Gemini | Generate narrative from derived stats | non-fatal — fall back to templated narrative, continue |
+
+**Behaviour:** Builds a compact aggregated-stats summary (no raw rows) and calls Gemini to produce the executive-summary narrative. On any Gemini failure (error, timeout, empty response) it falls back to a templated narrative built from the same derived stats. This node is **never fatal** — it always proceeds to `render_report` with some narrative. This is the only LLM use in the pipeline.
 
 ### `render_report`
 
-**Reads from state:** `profile`, charts, `narrative`
+**Reads from state:** `profile`, `charts`, `narrative`
 **Writes to state:** `report_html`, `status`
 **LLM call:** no
 **External calls:** `render_report_html` tool (pure)
@@ -125,7 +137,7 @@ ingest ──(error)──► handle_error ──► END
 profile ──(error)──► handle_error ──► END
   │
   ▼
-render_report ──► END
+narrate ──► render_report ──► END
 ```
 
 **Conditional edges:**
@@ -135,9 +147,9 @@ render_report ──► END
 | ingest | `state.get("error")` set | handle_error |
 | ingest | otherwise | profile |
 | profile | `state.get("error")` set | handle_error |
-| profile | otherwise | render_report |
+| profile | otherwise | narrate |
 
-(The Gemini narrative failure inside `profile` does NOT set `error` — it falls back to a template, so the flow proceeds to `render_report`.)
+`narrate → render_report` and `render_report → END` are unconditional edges. The Gemini narrative failure inside `narrate` does NOT set `error` — it falls back to a template, so the flow always proceeds to `render_report`.
 
 ---
 

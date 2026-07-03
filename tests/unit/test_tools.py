@@ -106,9 +106,32 @@ def test_report_escapes_html():
 
 
 def test_stats_summary_excludes_raw_rows():
-    summary = build_stats_summary(_profile(IRIS))
+    """Privacy guarantee (spec/roadmap.md): raw rows must NEVER reach the LLM.
+
+    build_stats_summary produces the exact text sent to Gemini, so this is a
+    prompt-spy: aggregates must be present, and no verbatim raw data row from
+    the dataset may appear in it.
+    """
+    profile = _profile(IRIS)
+    summary = build_stats_summary(profile)
+
+    # Aggregates ARE present.
     assert "Dataset shape" in summary
     assert "Numeric column summaries" in summary
+
+    # No raw data row leaks into the prompt.
+    sample = profile.get("sample_rows", {})
+    rows = sample.get("rows", [])
+    assert rows, "fixture must yield sample rows for this spy to be meaningful"
+    for row in rows:
+        # A full raw row (its cell values in order) must not appear verbatim,
+        # under any plausible serialization.
+        assert ", ".join(row) not in summary, f"raw row leaked: {row!r}"
+        assert ",".join(row) not in summary, f"raw row leaked: {row!r}"
+        assert "\t".join(row) not in summary, f"raw row leaked: {row!r}"
+        assert " ".join(row) not in summary, f"raw row leaked: {row!r}"
+    # The sample_rows structure itself must not be serialized into the prompt.
+    assert "sample_rows" not in summary
 
 
 def test_templated_narrative_mentions_shape():
