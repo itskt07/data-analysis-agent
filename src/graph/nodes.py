@@ -13,7 +13,7 @@ from pathlib import Path
 
 from graph.state import AgentState
 from llm.client import LLMClient
-from tools.profiling import parse_csv, profile_dataframe
+from tools.profiling import parse_dataset, profile_dataframe
 from tools.charts import render_charts
 from tools.report import render_report_html
 from tools.narrative import build_stats_summary, templated_narrative
@@ -28,9 +28,9 @@ def _load_prompt() -> str:
 
 
 def ingest(state: AgentState) -> AgentState:
-    """Validate + parse the uploaded CSV into a DataFrame."""
+    """Validate + parse the uploaded CSV or Parquet file into a DataFrame."""
     try:
-        df = parse_csv(state.get("csv_bytes") or b"")
+        df = parse_dataset(state.get("csv_bytes") or b"", state.get("filename"))
         logger.info(
             "ingest ok run_id=%s rows=%d cols=%d",
             state.get("run_id"), df.shape[0], df.shape[1],

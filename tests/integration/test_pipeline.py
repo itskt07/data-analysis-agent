@@ -49,6 +49,43 @@ def test_full_report_from_iris(_isolated_db):
 
 
 @pytest.mark.usefixtures("_require_llm_key")
+def test_full_report_from_parquet(_isolated_db):
+    """Parquet upload runs the same EDA pipeline and produces the full report."""
+    run_id = run_agent(_read("small_iris.parquet"), "small_iris.parquet")
+    run = _fetch(run_id)
+
+    assert run is not None
+    assert run.status == "completed"
+    assert run.error_message is None
+
+    html = run.report_html
+    assert html and "<!DOCTYPE html>" in html
+    assert "Summary statistics" in html
+    assert "sepal_length" in html
+    assert html.count("data:image/png;base64,") == 3
+
+
+def test_parquet_http_round_trip(api_client):
+    """POST /runs with a .parquet file -> completed, report renders."""
+    resp = api_client.post(
+        "/runs",
+        files={
+            "file": (
+                "small_iris.parquet",
+                _read("small_iris.parquet"),
+                "application/octet-stream",
+            )
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["status"] == "completed"
+    report = api_client.get(data["report_url"])
+    assert report.status_code == 200
+    assert report.headers["content-type"].startswith("text/html")
+
+
+@pytest.mark.usefixtures("_require_llm_key")
 def test_http_round_trip(api_client):
     """POST /runs multipart -> completed, then GET report -> HTML with charts."""
     resp = api_client.post(

@@ -3,7 +3,7 @@ import base64
 
 import pytest
 
-from tools.profiling import parse_csv, profile_dataframe
+from tools.profiling import parse_csv, parse_dataset, parse_parquet, profile_dataframe
 from tools.charts import render_charts, correlation_heatmap
 from tools.report import render_report_html
 from tools.narrative import build_stats_summary, templated_narrative
@@ -138,3 +138,37 @@ def test_templated_narrative_mentions_shape():
     text = templated_narrative(_profile(IRIS))
     assert "4 rows" in text
     assert "built-in template" in text
+
+
+def _iris_parquet_bytes() -> bytes:
+    import io
+    df = parse_csv(IRIS)
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    return buf.getvalue()
+
+
+def test_parse_parquet_round_trips_csv_data():
+    df = parse_parquet(_iris_parquet_bytes())
+    assert list(df.columns) == list(parse_csv(IRIS).columns)
+    assert df.shape == parse_csv(IRIS).shape
+
+
+def test_parse_dataset_dispatches_by_extension():
+    pq = _iris_parquet_bytes()
+    # .parquet / .pq route to the parquet reader...
+    assert parse_dataset(pq, "data.parquet").shape[1] > 0
+    assert parse_dataset(pq, "data.pq").shape[1] > 0
+    # ...anything else (or no name) is treated as CSV.
+    assert list(parse_dataset(IRIS, "data.csv").columns) == list(parse_csv(IRIS).columns)
+    assert list(parse_dataset(IRIS, None).columns) == list(parse_csv(IRIS).columns)
+
+
+def test_parse_parquet_empty_raises():
+    with pytest.raises(ValueError):
+        parse_parquet(b"")
+
+
+def test_parse_parquet_bad_bytes_raises():
+    with pytest.raises(ValueError, match="Parquet"):
+        parse_dataset(b"not a real parquet file", "corrupt.parquet")

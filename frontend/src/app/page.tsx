@@ -41,14 +41,19 @@ export default function Home() {
       setFile(null)
       return
     }
-    const isCsv = f.name.toLowerCase().endsWith('.csv') || f.type === 'text/csv'
-    if (!isCsv) {
-      setValidation('Please choose a .csv file.')
+    const lowerName = f.name.toLowerCase()
+    const isSupported =
+      lowerName.endsWith('.csv') ||
+      lowerName.endsWith('.parquet') ||
+      lowerName.endsWith('.pq') ||
+      f.type === 'text/csv'
+    if (!isSupported) {
+      setValidation('Please choose a .csv or .parquet file.')
       setFile(null)
       return
     }
     if (f.size === 0) {
-      setValidation('That file is empty. Choose a CSV with data.')
+      setValidation('That file is empty. Choose a CSV or Parquet file with data.')
       setFile(null)
       return
     }
@@ -168,13 +173,13 @@ export default function Home() {
               />
             </svg>
             <p className="mt-3 text-sm font-medium text-gray-700">
-              {file ? file.name : 'Drop a .csv file here, or click to browse'}
+              {file ? file.name : 'Drop a .csv or .parquet file here, or click to browse'}
             </p>
             <p className="mt-1 text-xs text-gray-400">CSV up to 50 MB</p>
             <input
               ref={inputRef}
               type="file"
-              accept=".csv,text/csv"
+              accept=".csv,.parquet,.pq,text/csv"
               className="sr-only"
               onChange={e => pickFile(e.target.files?.[0] ?? null)}
               data-testid="file-input"

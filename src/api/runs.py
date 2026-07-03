@@ -26,13 +26,20 @@ def _to_response(run: RunRow) -> dict:
     ).model_dump()
 
 
-def _is_csv_upload(file: UploadFile) -> bool:
+def _is_supported_upload(file: UploadFile) -> bool:
     name = (file.filename or "").lower()
     content_type = (file.content_type or "").lower()
-    if name.endswith(".csv"):
+    if name.endswith((".csv", ".parquet", ".pq")):
         return True
-    # Accept generic text/CSV content types when the extension is absent.
-    return content_type in {"text/csv", "application/csv", "text/plain"}
+    # Accept generic CSV/Parquet content types when the extension is absent.
+    return content_type in {
+        "text/csv",
+        "application/csv",
+        "text/plain",
+        "application/parquet",
+        "application/x-parquet",
+        "application/vnd.apache.parquet",
+    }
 
 
 @router.post("/runs")
@@ -40,8 +47,8 @@ async def create_run(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
 ) -> dict:
-    if not _is_csv_upload(file):
-        raise api_error("BAD_REQUEST", "Upload must be a CSV file.", 400)
+    if not _is_supported_upload(file):
+        raise api_error("BAD_REQUEST", "Upload must be a CSV or Parquet file.", 400)
 
     file_bytes = await file.read()
 
@@ -52,8 +59,8 @@ async def create_run(
             f"File exceeds the {get_settings().max_upload_mb} MB limit.",
             413,
         )
-    if not file_bytes or not file_bytes.strip():
-        raise api_error("BAD_REQUEST", "The uploaded CSV is empty.", 400)
+    if not file_bytes:
+        raise api_error("BAD_REQUEST", "The uploaded file is empty.", 400)
 
     run_id = run_agent(file_bytes, file.filename or "upload.csv")
     run = session.get(RunRow, run_id)

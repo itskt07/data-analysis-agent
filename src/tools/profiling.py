@@ -40,6 +40,40 @@ def parse_csv(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+def parse_parquet(file_bytes: bytes) -> pd.DataFrame:
+    """Parse raw Parquet bytes into a DataFrame.
+
+    Raises ValueError on empty input or an unparseable / column-less file.
+    """
+    if not file_bytes:
+        raise ValueError("The uploaded file is empty.")
+
+    try:
+        df = pd.read_parquet(io.BytesIO(file_bytes))
+    except Exception as exc:  # noqa: BLE001 - surface any parse failure as ValueError
+        raise ValueError(f"Could not parse the file as Parquet: {exc}") from exc
+
+    if df.shape[1] == 0:
+        raise ValueError("The Parquet file contains no columns.")
+    if df.shape[0] == 0:
+        raise ValueError("The Parquet file contains no data rows.")
+
+    return df
+
+
+def parse_dataset(file_bytes: bytes, filename: str | None = None) -> pd.DataFrame:
+    """Parse uploaded bytes into a DataFrame, dispatching by file extension.
+
+    Supports CSV (the default) and Parquet (``.parquet`` / ``.pq``). Both paths
+    raise ValueError on empty/unparseable/column-less input so the ingest node
+    can surface a clean error.
+    """
+    name = (filename or "").lower()
+    if name.endswith(".parquet") or name.endswith(".pq"):
+        return parse_parquet(file_bytes)
+    return parse_csv(file_bytes)
+
+
 def _clean_number(value: Any) -> float | int | None:
     """Coerce a numpy/pandas scalar to a JSON-safe python number (or None)."""
     if value is None:
