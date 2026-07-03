@@ -6,26 +6,21 @@
 
 ## What Is a Capability?
 
-A capability is a single, discrete action or behavior the agent performs. Examples:
-- "Search the web for companies matching criteria X"
-- "Draft a personalized email given a lead profile"
-- "Send a Slack notification when a threshold is crossed"
+A capability is a single, discrete action the agent performs.
 
 ## Capabilities in This Project
 
-<!-- FILL IN: List capabilities here as they are defined. Each entry links to its spec file (no number prefix). -->
+| Capability | File | Phase |
+|-----------|------|-------|
+| Profile dataset (EDA + report) | [profile.md](profile.md) | 1 |
+| Train model | [train.md](train.md) | 2 |
+| Schedule EDA runs & delivery | [schedule.md](schedule.md) | 3 |
 
-| Capability | File |
-|-----------|------|
-| <!-- name --> | [name.md](name.md) |
+> Report rendering is part of the Phase 1 `profile` capability (the EDA run produces the self-contained HTML report), so it is not a separate capability file. The Phase 3 `schedule` capability reuses that same EDA pipeline on a timer — it adds no new agent graph.
 
 ## How to Add a New Capability
 
-Run `/zero-shot-build [description]` on the existing spec. The spec-writer sub-agent will:
-1. Create a new file in this directory (`<name>.md`, no number prefix)
-2. Update this index
-3. Flag any dependencies on existing capabilities
-4. Self-review that it fits the architecture and data model before returning
+Create a new `<name>.md` in this directory describing inputs, outputs, side-effects, and tests. Optionally run `/zero-shot-build` to scaffold it.
 
 ## Capability File Template
 
@@ -36,3 +31,4 @@ Each capability file should answer:
 - **External calls** (APIs, LLMs, databases it touches)
 - **Error cases** (what can go wrong and how it's handled)
 - **Success criteria** (how we test it)
+

@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./data/agent.db")
     log_level: str = Field(default="INFO")
 
+    # Maximum uploaded CSV size, in megabytes.
+    max_upload_mb: int = Field(default=50)
+
     # LLM provider — auto-detected from whichever key is set if left blank
     llm_provider: str = Field(default="")   # "anthropic" | "gemini"
     llm_model: str = Field(default="")      # uses provider default when blank

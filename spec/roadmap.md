@@ -1,62 +1,164 @@
 # Roadmap
 
-> Fill in each section. Run `/zero-shot-build [your idea]` to have it filled automatically.
+This roadmap scopes and sequences a data-analysis agent that ingests tabular data, runs automated exploratory analysis, produces a self-contained visual report, and (in later phases) trains simple ML models and schedules runs.
 
 ---
 
 ## What This Agent Does
 
-<!-- FILL IN: One paragraph describing what this agent does, who uses it, and what problem it solves. -->
+The Data Analysis Agent helps analysts and data-literate product owners upload a CSV dataset, run automated exploratory data analysis (EDA), and receive a single downloadable, self-contained HTML report with summary-statistics tables, missingness and sample-row tables, chart visualizations, and a short human-readable narrative. It reduces time-to-insight for common tabular analysis tasks and automates repeatable reporting.
 
 ## Who Uses It
 
-<!-- FILL IN: Primary user(s). What is their role? What are they trying to accomplish? -->
+- Primary: data analysts and product managers who need quick EDA and a shareable report.
+- Secondary: data engineers who want a fast, reproducible profile of a new dataset.
 
 ## Core Problem Being Solved
 
-<!-- FILL IN: What manual or broken process does this agent replace or improve? -->
+Manual EDA is repetitive and error-prone: analysts write ad-hoc scripts to profile data, generate charts, and hand-write a summary. The agent standardizes EDA and produces a single shareable report with minimal setup.
 
 ## Success Criteria
 
-<!-- FILL IN: How do we know the agent is working? List 3-5 measurable outcomes. -->
-
-- [ ] <!-- criterion 1 -->
-- [ ] <!-- criterion 2 -->
-- [ ] <!-- criterion 3 -->
+- A user can upload a CSV and receive a self-contained HTML EDA report (summary-stats table, missingness table, sample-rows table, 3 embedded charts, and a narrative) synchronously — well under 60s for datasets ≤ 50 MB.
+- The report is a single self-contained HTML document (charts embedded as base64 PNG) that downloads and opens offline.
+- If the LLM narrative call fails, the run still completes with a templated narrative — no crash.
+- The Phase 1 integration gate passes against the real Gemini key.
 
 ## What This Agent Does NOT Do (Out of Scope)
 
-<!-- FILL IN: Explicit exclusions prevent scope creep. List things the agent will never do. -->
+- Large-scale or distributed processing, distributed training, or hyperparameter search.
+- Replacing full-featured BI tools or model-deployment orchestration.
+- Unstructured data (free text/images) beyond basic CSV columns.
+- Sending raw dataset rows to any external LLM (only derived, aggregated statistics are sent).
 
 ## Key Constraints
 
-<!-- FILL IN: Hard limits — budget, latency, compliance, API rate limits, etc. -->
+- Target dataset size: ≤ 50 MB (local, in-process). Larger datasets are deferred to future phases.
+- Privacy: CSVs may contain PII — the system never sends raw rows to the LLM; only derived aggregated summary statistics are sent to generate the narrative. **This holds in Phase 3:** scheduled runs still send only aggregated stats to Gemini.
+- Runs execute **synchronously inside the HTTP request** — there is no worker queue in Phases 1–2. Phase 3 adds an **in-process** scheduler (APScheduler) that reuses the same synchronous EDA pipeline on a timer — still no external broker (no Celery/Redis/RQ).
+- **Raw-row persistence exception (Phase 3, opt-in only):** to re-run on a cadence a schedule must store the uploaded CSV bytes. This is the ONE deliberate exception to the "raw rows are never persisted" default, and it applies **only** to datasets a user explicitly attaches to a schedule. Ad-hoc `POST /runs` / `POST /train` uploads still never persist raw rows. The PII-to-LLM rule is unchanged in all cases (only aggregated stats reach Gemini). See [data.md](data.md).
 
 ## Phases of Development
 
-<!-- FILL IN: The spec-writer fills these in. One phase = one user-testable increment, behind a human testing gate. Default each phase's slices to INDEPENDENT so generators build them concurrently; declare a dependency only when a slice truly needs another's output. Use the per-phase template below — one block per phase. -->
+Each phase is one human-testable increment. Tests in `tests/` gate each phase, run against the real Gemini key from `.env`.
 
-> **Phase 1 is the smallest first-time-right user-testable win.** It must work perfectly the first time the user tests it — zero rough edges on the tested path. Its backend is minimal but REAL on the one core path (no fake data on the tested path). Its frontend is visually complete: real UI for the one working path PLUS clearly-labelled NON-FUNCTIONAL stubs for everything coming later, so the user sees the vision (a stub must never be mistaken for a bug). Each later phase wires those stubs into real functionality, one increment at a time.
+### Phase 1 — EDA + Reporting (the smallest testable win)
 
-### Phase 1 — <!-- short name -->
+**Goal:** Upload a CSV → run automated EDA synchronously → produce a downloadable, self-contained HTML report containing:
+- a **summary-statistics table** (per column: dtype, count, missing count/%, and mean/std/min/max for numerics, unique/top for categoricals),
+- a **missingness table** and a **sample-rows table** (first N rows),
+- **3 rendered chart visualizations** — a histogram (a numeric column), a boxplot (numeric columns), and a correlation heatmap (numeric columns) — rendered with matplotlib (Agg backend) and embedded as base64 PNG,
+- a short **narrative / executive summary** generated by Gemini (`gemini-2.5-flash`) from the derived aggregated statistics only. If Gemini errors, the run degrades to a templated summary and still completes.
 
-- **Goal:** <!-- FILL IN: the single smallest user-testable win this phase delivers. -->
-- **Independent slices (parallel build units):** <!-- FILL IN: each slice is a disjoint unit a single generator owns. Note its surface (frontend / backend) and any declared dependency on another slice (default: none). -->
-  - `slice-a` (backend) — <!-- what it builds; deps: none -->
-  - `slice-b` (frontend) — <!-- what it builds; deps: none -->
-- **Key surfaces / files:** <!-- FILL IN: the files/dirs each slice touches. frontend writes the frontend surface; backend writes src/. Never the same file. -->
-- **Gate command:** <!-- FILL IN: one exact runnable command that proves the phase works — real LLM/API via .env keys, production DB driver (never SQLite-as-substitute). e.g. `uv run pytest tests/test_phase1.py` -->
-- **How the user tests it (handoff seed):** <!-- FILL IN: exact run command(s), what to click / look at, the expected result, and which parts are labelled stubs vs real. -->
+The 5 report artifacts are: the 3 rendered charts (histogram, boxplot, correlation heatmap) PLUS the missingness table and the sample-rows table.
 
-### Phase 2 — <!-- short name -->
+**Independent slices** (disjoint file paths, fully parallel):
 
-- **Goal:** <!-- FILL IN: next user-testable increment (typically wires a Phase-1 stub into real functionality). -->
-- **Independent slices (parallel build units):**
-  - `slice-a` (backend) — <!-- ...; deps: none -->
-  - `slice-b` (frontend) — <!-- ...; deps: none -->
-- **Key surfaces / files:** <!-- FILL IN -->
-- **Gate command:** <!-- FILL IN: exact runnable command, real LLM/API + production DB driver -->
-- **How the user tests it (handoff seed):** <!-- FILL IN -->
+- **`backend-eda`** (backend) — owns everything under `src/` + backend tests + fixtures. Deps: none.
+  - Multipart CSV upload endpoint + validation (must be CSV, non-empty, size limit).
+  - Pandas profiling engine as pure functions under `src/tools/`.
+  - Matplotlib chart generation (Agg) → base64 PNG.
+  - Self-contained HTML report renderer.
+  - Gemini narrative node (derived stats only) with templated fallback.
+  - New `AgentState`, graph nodes/edges/runner for `ingest → profile → render_report`.
+  - DB model changes (store outcome + report HTML).
+  - API endpoints per [api.md](api.md).
+- **`frontend-dashboard`** (frontend) — owns everything under `frontend/`. Deps: none (builds against the [api.md](api.md) contract, not backend runtime).
+  - CSV upload UI (dropzone/file input) + progress state.
+  - Report viewer (embeds the returned HTML via iframe/srcdoc, same-origin) + download button + error states.
+  - Clearly-labelled NON-FUNCTIONAL stubs: "Train a model (Phase 2)" and "Schedule runs (Phase 3)" that visibly say "Coming soon" so they can never be mistaken for bugs.
+  - A `frontend/tests/e2e/` Playwright smoke test covering the primary journey (load `/app/`, upload a fixture CSV, assert the report renders + download button + "Coming soon" stubs).
 
-<!-- Repeat the per-phase block for every phase. -->
+**Key surfaces / files:** `src/api/runs.py`, `src/domain/run.py`, `src/db/models.py`, `src/graph/state.py`, `src/graph/nodes.py`, `src/graph/edges.py`, `src/graph/agent.py`, `src/graph/runner.py`, `src/tools/` (profiling + charts + report), `src/prompts/narrative.md`, `frontend/src/app/page.tsx`, `tests/integration/test_pipeline.py`, `tests/fixtures/*.csv`.
 
+**Gate command:** `uv run pytest tests/integration/test_pipeline.py -v`
+
+The integration tests must exercise, against the real Gemini key: upload a fixture CSV → run completes with status `completed` → an HTML report is produced containing the summary table, missingness table, sample rows, the 3 base64 charts, and a narrative; plus edge/error cases: non-CSV rejected (400), empty CSV rejected (400), and a CSV with all-missing / single-column / non-numeric-only columns still produces a report; plus the full HTTP round-trip via the `api_client` fixture.
+
+**Frontend slice gate:** `cd frontend && pnpm exec playwright test` — the `frontend/tests/e2e/` smoke test runs against the running app (`uv run python -m src` on port 8001) and asserts the upload → report → download journey plus the labelled "Coming soon" stubs.
+
+**How the user tests it:** Run the gate command. Then (server launched by the orchestrator via `uv run python -m src`) open `http://localhost:8001/app/`, upload a file from `tests/fixtures/*.csv`, and see the rendered EDA report with the stats tables and 3 charts plus the narrative, with a download button. The "Train a model" and "Schedule runs" sections are visibly "Coming soon" stubs (real-on-path: upload + report + download; labelled stubs: Train, Schedule).
+
+### Phase 2 — Model Training & Evaluation (ACTIVE)
+
+**Goal:** Upload a labeled CSV + pick a target column → train a scikit-learn model → show evaluation metrics → download a joblib model artifact. This wires the currently-stubbed "Train a model" tile into real functionality. "Schedule runs" stays a labelled Phase-3 stub.
+
+The Train flow is a **separate deterministic graph** from the EDA graph, mirroring the Phase-1 structure (its own `TrainState`, nodes, runner, and DB table `training_runs`). Training is deterministic and local (scikit-learn); the only LLM call is a non-fatal `summarize` step that turns aggregated metrics into a short insight (templated fallback on failure) — see [agent.md](agent.md). Still synchronous + SQLite; no worker queue.
+
+- **Task detection (deterministic):** non-numeric target → classification; numeric target → classification if integer-like AND unique-value count ≤ `max(20, 5% of rows)`, else regression.
+- **Algorithms** (form field `algorithm`, default `auto`): classification → `logistic_regression`=LogisticRegression, `random_forest`=RandomForestClassifier, `auto`=random_forest; regression → `logistic_regression`=LinearRegression, `random_forest`=RandomForestRegressor, `auto`=random_forest.
+- **Metrics:** classification → accuracy, f1 (weighted), precision (weighted), recall (weighted), n_classes, classes, n_test; regression → r2, mae, rmse, n_test.
+- **Artifact:** the fitted sklearn `Pipeline` (preprocessing + estimator) is joblib-serialized and stored inline as a BLOB in `training_runs`, downloadable via `GET /train/{id}/artifact` (see [api.md](api.md), [data.md](data.md)).
+- **Privacy (unchanged):** the `summarize` (Gemini) node receives ONLY aggregated metrics + column/feature names — never raw cell values.
+
+**Independent slices** (disjoint file paths, fully parallel):
+
+- **`backend-train`** (backend) — Deps: none. Owns:
+  - `pyproject.toml` (add `scikit-learn` and `joblib` deps).
+  - `src/tools/training.py` (pure functions: task detection, pipeline building, fit, metrics, joblib serialization).
+  - `src/graph/train_state.py`, `src/graph/train_nodes.py`, `src/graph/train_agent.py`, `src/graph/train_runner.py`.
+  - `src/db/models.py` (add the `TrainingRun` model → `training_runs` table).
+  - `src/domain/training.py` (new `TrainResponse` pydantic model).
+  - `src/api/train.py` (new router) + register it in `src/api/__init__.py`.
+  - `src/prompts/train_insight.md` (Gemini system prompt for the metrics insight).
+  - Tests: `tests/unit/test_training_tools.py`, `tests/integration/test_training.py`; fixtures `tests/fixtures/train_classification.csv`, `tests/fixtures/train_regression.csv`.
+- **`frontend-train`** (frontend) — Deps: builds against the [api.md](api.md) contract; its live Playwright e2e test depends on the backend only at gate time. Owns:
+  - `frontend/src/app/page.tsx` — replace the "Train a model" `ComingSoon` tile with a **real Train panel** (file upload + target-column input + algorithm select `Auto`/`Logistic Regression`/`Random Forest` + submit → metrics view + a Download model button hitting `artifact_url`). Keep the "Schedule runs" tile as a labelled `ComingSoon` stub.
+  - `frontend/tests/e2e/*` — a Playwright test covering the train journey (upload a labeled CSV, pick a target column, submit, assert metrics render + Download model button appears; assert "Schedule runs" is still "Coming soon").
+
+**Key surfaces / files:** `src/tools/training.py`, `src/graph/train_state.py`, `src/graph/train_nodes.py`, `src/graph/train_agent.py`, `src/graph/train_runner.py`, `src/db/models.py`, `src/domain/training.py`, `src/api/train.py`, `src/api/__init__.py`, `src/prompts/train_insight.md`, `frontend/src/app/page.tsx`, `tests/unit/test_training_tools.py`, `tests/integration/test_training.py`, `tests/fixtures/train_*.csv`.
+
+**Gate command:** `uv run pytest tests/integration/test_training.py -v` — and the full suite must stay green (`uv run pytest -v`).
+
+The integration tests must exercise, against the real Gemini key: `POST /train` with `train_classification.csv` (a target column with several classes) → status `completed`, `task_type=classification`, metrics include accuracy/f1/precision/recall, `artifact_url` set, and `GET /train/{id}/artifact` returns downloadable joblib bytes; `POST /train` with `train_regression.csv` (continuous target) → `task_type=regression`, metrics include r2/mae/rmse; plus error cases: missing `target_column` (400), `target_column` not in the CSV (400), non-CSV (400), empty CSV (400), too few rows to train (400), unknown `train_id` (404). Each fixture must have enough rows that the 0.75/0.25 train/test split yields a non-trivial test set (≥ ~40 rows) so metrics are meaningful, not degenerate.
+
+**Frontend slice gate:** `cd frontend && pnpm exec playwright test` — the `frontend/tests/e2e/` train test runs against the running app (`uv run python -m src` on port 8001) and asserts the upload → target-column → train → metrics → Download model journey plus the labelled "Schedule runs — Coming soon" stub.
+
+**How the user tests it:** Run the gate command. Then (server launched via `uv run python -m src`) open `http://localhost:8001/app/`, and in the **Train panel** upload a labeled CSV (e.g. `tests/fixtures/train_classification.csv`), pick a target column, pick an algorithm (or leave **Auto**), and submit. See the evaluation metrics render plus a **Download model** button that downloads a `.joblib` artifact. The "Schedule runs" section remains a visible "Coming soon" stub (real-on-path: Train + metrics + download; labelled stub: Schedule).
+
+### Phase 3 — Scheduling & Delivery (ACTIVE)
+
+**Goal:** Let a user create a **schedule** that re-runs an **EDA analysis** on a stored dataset on a recurring cadence, see the resulting **run history**, trigger a **Run now**, and optionally receive **delivery** via a webhook. This wires the currently-stubbed "Schedule runs" tile into real functionality. The EDA and Train flows from Phases 1–2 are unchanged.
+
+A **schedule** stores an uploaded CSV plus a cadence (`interval_minutes`) and an optional `webhook_url`. An **in-process APScheduler `BackgroundScheduler`** — started in the FastAPI lifespan ([architecture.md](architecture.md), [agent.md](agent.md)) — fires each active schedule on its interval, reusing the existing synchronous EDA pipeline (`run_agent` in `src/graph/runner.py`) to create a normal `runs` row. A **Run now** endpoint executes a schedule immediately (no waiting for the interval) so a human — and the gate — can test end-to-end in seconds. After each scheduled/Run-now execution completes, if the schedule has a `webhook_url`, a small JSON payload (schedule id, run id, status, report_url) is POSTed to it; webhook failure is **non-fatal** (logged, execution still recorded).
+
+**Key constraints locked for this phase:**
+- **In-process, no broker.** APScheduler `BackgroundScheduler` in the app lifespan — NOT Celery/Redis/RQ. Jobs run in the same process, synchronously reusing the EDA pipeline. Honest limitation: schedules only fire while the server process is running; on startup all `active` schedules are **re-registered** from the DB (persistence of the schedule definition survives restarts, but missed fires while the process was down are not back-filled).
+- **Opt-in dataset persistence.** The schedule's CSV bytes are stored inline (`schedules.csv_bytes` BLOB) so the pipeline can re-run without re-upload — the deliberate, scoped exception documented in Key Constraints and [data.md](data.md). Still only aggregated stats reach Gemini.
+- **Cadence = `interval_minutes`** (primary, testable). A `cron` string is **out of scope** for this phase (deferred — see Phase 4).
+- **Auth/RBAC = OUT OF SCOPE** for Phase 3 — stays no-auth, consistent with Phases 1–2 (deferred to Phase 4).
+
+**Independent slices** (disjoint file paths, fully parallel):
+
+- **`backend-scheduling`** (backend) — owns all new/changed files under `src/` (except the frontend) + backend tests + fixture. Deps: none. Owns:
+  - `pyproject.toml` (add the `apscheduler` dependency).
+  - `src/scheduling/scheduler.py` — a module owning the `BackgroundScheduler` singleton: `start()` (called from lifespan), `register(schedule)`, `unregister(schedule_id)`, `reregister_active()` (re-adds all `active` schedules from the DB on startup), and `execute_schedule(schedule_id)` (loads the schedule's CSV bytes, calls `run_agent`, updates `last_run_at`, POSTs the webhook if set). This is the ONE new touch to `src/api/__init__.py`'s lifespan (add `scheduler.start()` + `reregister_active()` after `init_db()`).
+  - `src/api/schedules.py` — new router (`POST /schedules`, `GET /schedules`, `GET /schedules/{id}`, `POST /schedules/{id}/run`, `DELETE /schedules/{id}`) registered in `src/api/__init__.py`.
+  - `src/db/models.py` — add the `ScheduleRow` model → `schedules` table (see [data.md](data.md)).
+  - `src/domain/schedule.py` — `ScheduleResponse` / `ScheduleDetailResponse` pydantic models.
+  - Tests: `tests/integration/test_scheduling.py`; fixture reuses an existing `tests/fixtures/*.csv`.
+  - **Note the one shared file with the frontend slice: none.** The lifespan edit and router registration in `src/api/__init__.py` are owned entirely by this slice; the frontend slice never touches `src/`.
+- **`frontend-schedule`** (frontend) — owns everything under `frontend/`. Deps: builds against the [api.md](api.md) contract; its live Playwright e2e test depends on the backend only at gate time. Owns:
+  - `frontend/src/app/page.tsx` — replace the "Schedule runs" `ComingSoon` tile with a **real Schedule panel**: a create-schedule form (CSV file + `interval_minutes` + optional `webhook_url` + optional `name`), a **schedules list**, a per-schedule expandable **run history** (the schedule's `runs`, each linking to its report), a **Run now** button, and a **Delete** button. No labelled stubs remain after Phase 3 — the Train and Schedule tiles are both real.
+  - `frontend/tests/e2e/*` — a Playwright test covering the schedule journey: create a schedule on a fixture CSV, click **Run now**, assert a run appears in the schedule's history with a viewable report link. (Interval-based firing is not asserted in e2e — Run now is the deterministic path.)
+
+**Key surfaces / files:** `pyproject.toml`, `src/scheduling/scheduler.py`, `src/api/schedules.py`, `src/api/__init__.py`, `src/db/models.py`, `src/domain/schedule.py`, `frontend/src/app/page.tsx`, `tests/integration/test_scheduling.py`.
+
+**Gate command:** `uv run pytest tests/integration/test_scheduling.py -v` — and the full suite must stay green (`uv run pytest -v`).
+
+The integration tests must exercise, against the real Gemini key (the scheduled EDA run reuses the real narrate node): `POST /schedules` with a fixture CSV + `interval_minutes` → status object with a new `schedule_id`, `active=true`, empty run history; `GET /schedules` lists it; `POST /schedules/{id}/run` (**Run now**) synchronously creates a `runs` row and returns it → `GET /schedules/{id}` now shows that run in its history with status `completed` and a `report_url`, and `GET /runs/{run_id}/report` returns the HTML; `DELETE /schedules/{id}` removes it (`GET /schedules/{id}` → 404) and unregisters its job; plus a **webhook** case: create a schedule with a `webhook_url` pointing at a local capture endpoint (a lightweight test HTTP server / `pytest-httpserver`-style stub or a captured `POST /schedules/{id}/run` follow-up), Run now, assert the webhook received a payload with `schedule_id`, `run_id`, `status`, `report_url`; plus a **webhook-failure-is-non-fatal** case (unreachable `webhook_url` → the run still records `completed`); plus error cases: `POST /schedules` with no file (400), non-CSV (400), empty CSV (400), missing/invalid `interval_minutes` (400), and `GET`/`POST run`/`DELETE` on an unknown `schedule_id` (404).
+
+> The webhook capture in the gate uses a real local HTTP listener (not a mock of the POST call) so the delivery path is genuinely exercised over the wire.
+
+**Frontend slice gate:** `cd frontend && pnpm exec playwright test` — the `frontend/tests/e2e/` schedule test runs against the running app (`uv run python -m src` on port 8001) and asserts the create-schedule → Run now → run-appears-in-history → report-link journey.
+
+**How the user tests it:** Run the gate command. Then (server launched via `uv run python -m src`) open `http://localhost:8001/app/`, and in the **Schedule panel** create a schedule from a fixture CSV (e.g. `tests/fixtures/*.csv`) with an interval of a few minutes and (optionally) a `webhook_url`. Click **Run now** — within seconds a run appears in that schedule's **run history** with a link that opens the same self-contained EDA report as Phase 1; if a webhook was set, the receiver gets a JSON payload. Leave the app running and the schedule re-fires on its interval, appending further runs to history. Use **Delete** to remove the schedule. Everything on this page is now real (no "Coming soon" stubs remain).
+
+### Phase 4 — Cron cadence, auth & richer delivery (deferred)
+
+**Goal:** production-hardening on top of the Phase 3 scheduler.
+
+- Adds: cron-string cadence (alongside `interval_minutes`), auth/RBAC (JWT/API key), email/Slack delivery, run cancel, URL-based ingest, and (if load justifies) durable scheduling / a broker.
+- Gate command (indicative): `uv run pytest tests/integration/test_phase4.py -v`.
+
+> **Assumed:** Phase 4 is directional only; its slices, entities, and any heavier infrastructure are finalized when it is scoped. Phases 1–3 introduce no Postgres, Redis, Celery/RQ, S3, or auth. Phases 2 and 3 are scoped and active (see above).

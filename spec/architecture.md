@@ -1,68 +1,86 @@
 # Architecture
 
-> Fill in this section — see comments below.
-
----
-
 ## System Overview
 
-<!-- FILL IN: One paragraph describing the system at a high level. Who/what interacts with it? -->
+A same-origin web app: a Next.js static-export frontend (served by FastAPI at `/app/`) and a FastAPI backend on port 8001. A user uploads a CSV; the backend validates it, runs an in-process EDA graph **synchronously inside the request**, persists the run outcome and the rendered HTML report in SQLite, and returns links the UI embeds and downloads. There is no worker queue, no external object store, and no separate database server in Phase 1.
 
 ## Component Map
 
-<!-- FILL IN: List the major components and what each does. -->
-
 ```
-[Component A]
-    ↓
-[Component B]   ←→   [External Service]
-    ↓
-[Component C]
+Browser
+  │  (same-origin, relative paths — no /api/v1 prefix)
+  ▼
+FastAPI (uvicorn, port 8001)
+  ├─ /app/*   → Next.js static export (frontend/out/), mounted by FastAPI
+  ├─ /health  → health check
+  ├─ /runs*   → run lifecycle + report (src/api/runs.py)
+  │
+  ├─ Graph (in-process, src/graph/): ingest → profile → render_report → END
+  │     ├─ profile  → src/tools/ (pandas profiling, matplotlib charts)
+  │     ├─ render   → src/tools/ (self-contained HTML report)
+  │     └─ narrative → Gemini (gemini-2.5-flash), derived stats only
+  │
+  └─ SQLite (SQLAlchemy 2.0) — run metadata + report HTML
 ```
 
 ## Layers
 
-<!-- FILL IN: Describe the layers of the system (e.g., API → Agent Loop → Tools → Storage). -->
-
 | Layer | Responsibility |
 |-------|----------------|
-| <!-- layer --> | <!-- responsibility --> |
+| UI | CSV upload, progress state, embedded report viewer + download, labelled Phase 2/3 stubs |
+| API | Run lifecycle, report serving (HTML document) — no auth in Phase 1 |
+| Agent/Graph | Orchestrates `ingest → profile → render_report` synchronously in-process |
+| Tools | Pure functions: pandas profiling, matplotlib chart generation, HTML report rendering |
+| Storage | SQLite for run metadata + the rendered report HTML |
 
 ## Data Flow
 
-<!-- FILL IN: Walk through the main data flow from trigger to output. -->
-
-1. Trigger: <!-- how does the agent start? (cron, webhook, user input, etc.) -->
-2. <!-- step 2 -->
-3. <!-- step 3 -->
-4. Output: <!-- what does the agent produce? -->
+1. Trigger: user uploads a CSV via the UI or `POST /runs` (multipart, field `file`).
+2. API validates the file (is CSV, non-empty, within size limit), creates a `Run` row.
+3. The graph runs **synchronously** in the request: `ingest` (read + validate CSV into a DataFrame) → `profile` (derive aggregated stats, render 3 charts, call Gemini for the narrative with derived stats only, falling back to a template on error) → `render_report` (assemble the self-contained HTML).
+4. The run row is updated with `status`, `narrative`, and `report_html`; the response returns `run_id`, `status`, `report_url`, `narrative`, `error`.
+5. Frontend embeds the report from `GET /runs/{run_id}/report` (raw HTML) and offers a download.
 
 ## External Dependencies
 
-<!-- FILL IN: APIs, services, databases the agent depends on. -->
-
 | Dependency | Purpose | Failure Mode |
 |------------|---------|--------------|
-| <!-- name --> | <!-- what it does --> | <!-- what happens if it's down --> |
+| Gemini (`gemini-2.5-flash`, `AGENT_GEMINI_API_KEY`) | Generate the narrative from derived aggregated stats only | Degrade to a templated narrative; the run still completes |
+| SQLite (local file) | Run metadata + report HTML | Write failure surfaces as a run error (local disk) |
 
 ## Stack
 
-> This project's concrete technology choices (captured at intake, filled by the spec-writer). The generic, every-project rules — model-naming, DB driver, dev port, test environment — live in `harness/patterns/tech-stack.md`; this section is only what **this** project picked.
+- **Language:** Python 3.11+ (backend); TypeScript (frontend).
+- **Agent framework:** LangGraph (`langgraph` package) used as an in-process `StateGraph` in `src/graph/` — synchronous, no external checkpointer.
+- **LLM provider + model:** Google Gemini, model `gemini-2.5-flash`, key `AGENT_GEMINI_API_KEY` in `.env` (provider auto-detected from the key). Used **only** to generate the report narrative from derived, aggregated statistics — never raw rows. Accessed via `LLMClient().call_model(prompt, system=None)`.
+- **Backend:** FastAPI (uvicorn), run with `uv run python -m src` → `src/__main__.py`, serving on **port 8001**; health at `GET /health`.
+- **Database + ORM:** SQLite via SQLAlchemy 2.0. Tables created at startup by `init_db()` → `Base.metadata.create_all` (app lifespan). Default URL `sqlite:///./data/agent.db` (`AGENT_DATABASE_URL`). **No Alembic migrations are wired** — no migration step for the user.
+- **Frontend:** Next.js 15 static export (`output: 'export'`, `basePath: '/app'`, `trailingSlash: true`), built with `cd frontend && pnpm build` → `frontend/out/`, mounted by FastAPI at `/app/`. UI and API are **same-origin**; the frontend calls relative paths (e.g. `/runs`) with **no `/api/v1` prefix**.
+- **Dependency management:** uv (Python), pnpm (frontend).
+- **Observability:** structured request/response logging (input, output summary, latency, error) to stdout via `structlog` — wired from Phase 1. (No LangSmith/OpenTelemetry/Prometheus in Phase 1.)
 
-- **Language:** <!-- FILL IN: e.g., Python 3.12 -->
-- **Agent framework:** <!-- FILL IN: e.g., LangGraph / custom / none -->
-- **LLM provider + model:** <!-- FILL IN: e.g., Anthropic / claude-sonnet-4-6 -->
-- **Backend:** <!-- FILL IN: e.g., FastAPI / none -->
-- **Database + ORM:** <!-- FILL IN: e.g., PostgreSQL + SQLAlchemy 2.0 / none -->
-- **Frontend:** <!-- FILL IN: e.g., Next.js / none -->
-- **Dependency management:** <!-- FILL IN: e.g., uv + pyproject.toml -->
+| Key library | Purpose |
+|-------------|---------|
+| FastAPI + uvicorn | HTTP API + server |
+| SQLAlchemy 2.0 | SQLite ORM |
+| langgraph | In-process graph orchestration |
+| pandas | CSV profiling / EDA |
+| matplotlib (Agg backend) | Chart rendering → base64 PNG |
+| google-genai | Gemini client (narrative) |
+| structlog | Structured logging |
+| scikit-learn + joblib (Phase 2) | Model training + artifact serialization |
+| apscheduler (Phase 3) | In-process `BackgroundScheduler` for recurring EDA runs — no broker |
 
-| Key library | Version | Purpose |
-|-------------|---------|---------|
-| <!-- name --> | <!-- ver --> | <!-- purpose --> |
+**Avoid in Phase 1:** worker queues, distributed processing, and heavyweight MLOps stacks — kept out to keep Phase 1 the smallest testable win.
 
-**Avoid:** <!-- FILL IN: libraries/patterns explicitly off-limits, and why -->
+### Phase 3 — Scheduling (in-process, no broker)
+
+Phase 3 adds an **APScheduler `BackgroundScheduler`** started in the FastAPI lifespan (`src/api/__init__.py`, after `init_db()`) and a `src/scheduling/scheduler.py` module owning it. It fires each active schedule's interval job **in-process** (a background thread in the same uvicorn process), reusing the synchronous EDA runner `run_agent`; a **Run now** endpoint executes the same logic synchronously in the request. Schedule definitions (incl. the stored CSV BLOB) live in the SQLite `schedules` table and are re-registered on startup. Delivery is a best-effort webhook POST after each run (non-fatal). Still **no Redis/Celery/RQ, no Postgres, no object store** — the lightweight single-process model is preserved. See [agent.md](agent.md) (Phase 3 — Scheduling) and [data.md](data.md).
+
+## Deferred to future phases
+
+- **Postgres** (managed metadata store), **Redis + Celery/RQ** (worker queue), **S3 / object storage** (artifact store), and **auth (JWT/API key)** are **not used in Phases 1–3**. Phase 3 scheduling is deliberately **in-process** (APScheduler) rather than a broker. These may be introduced in Phase 4 (cron cadence, auth, richer delivery, durable scheduling) if load or requirements justify it — not before.
 
 ## Deployment Model
 
-<!-- FILL IN: How does this run? (local script, cloud function, long-running service, etc.) -->
+Single process: `uv run python -m src` serves both the API and the mounted static frontend on port 8001 against a local SQLite file. No separate worker, database server, or object store to provision in Phase 1.
