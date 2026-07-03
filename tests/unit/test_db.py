@@ -1,12 +1,11 @@
 """DB layer tests — no LLM key required."""
 from sqlalchemy.orm import Session
 from db.models import RunRow
-import db.session as session_module
 
 
 def test_run_row_roundtrip(_isolated_db):
     with Session(_isolated_db) as s:
-        run = RunRow(input_text="hello world")
+        run = RunRow(filename="data.csv")
         s.add(run)
         s.commit()
         run_id = run.id
@@ -14,14 +13,15 @@ def test_run_row_roundtrip(_isolated_db):
     with Session(_isolated_db) as s:
         fetched = s.get(RunRow, run_id)
         assert fetched is not None
-        assert fetched.input_text == "hello world"
+        assert fetched.filename == "data.csv"
         assert fetched.status == "pending"
-        assert fetched.output_text is None
+        assert fetched.narrative is None
+        assert fetched.report_html is None
 
 
-def test_run_row_status_update(_isolated_db):
+def test_run_row_outcome_update(_isolated_db):
     with Session(_isolated_db) as s:
-        run = RunRow(input_text="test")
+        run = RunRow(filename="data.csv")
         s.add(run)
         s.commit()
         run_id = run.id
@@ -29,25 +29,23 @@ def test_run_row_status_update(_isolated_db):
     with Session(_isolated_db) as s:
         run = s.get(RunRow, run_id)
         run.status = "completed"
-        run.output_text = "some output"
+        run.narrative = "A short summary."
+        run.report_html = "<html>report</html>"
         s.commit()
 
     with Session(_isolated_db) as s:
         run = s.get(RunRow, run_id)
         assert run.status == "completed"
-        assert run.output_text == "some output"
+        assert run.narrative == "A short summary."
+        assert run.report_html == "<html>report</html>"
 
 
 def test_multiple_runs_independent(_isolated_db):
-    ids = []
     with Session(_isolated_db) as s:
         for i in range(3):
-            run = RunRow(input_text=f"input {i}")
-            s.add(run)
+            s.add(RunRow(filename=f"file_{i}.csv"))
         s.commit()
-        # fetch all
-        runs = s.query(RunRow).all()
-        ids = [r.id for r in runs]
+        ids = [r.id for r in s.query(RunRow).all()]
 
     assert len(ids) == 3
-    assert len(set(ids)) == 3  # all unique
+    assert len(set(ids)) == 3

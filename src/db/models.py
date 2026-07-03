@@ -22,8 +22,9 @@ class RunRow(Base):
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
-    input_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    output_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    narrative: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_now
