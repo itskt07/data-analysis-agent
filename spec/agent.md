@@ -1,218 +1,221 @@
 # Agent
 
-> Required when the project uses an agent framework. Delete this file if your project has no agent framework.
->
-> If your project has no agent framework (e.g., a simple script or single-LLM API call), delete this file.
->
+This project uses a small pipeline-style agent built on **LangGraph** (`langgraph` package) as an in-process `StateGraph`. The graph models the EDA → reporting pipeline as discrete, deterministic nodes. It runs **synchronously inside the HTTP request** — there is no worker queue and no external checkpointer; the in-process state is transient and the outcome (status, narrative, report HTML) is persisted to the SQLite `runs` row.
 
 ---
 
 ## Agent Architecture Pattern
 
-<!-- FILL IN: Which pattern does this agent follow? Choose one and describe why. -->
-
-| Pattern | Use when |
-|---------|----------|
-| **Single-agent loop** | One LLM drives a deterministic tool-call loop. No branches, no handoffs. |
-| **Graph (LangGraph)** | Multi-step pipeline with conditional edges, checkpointing, or parallel nodes. |
-| **Multi-agent** | Specialised sub-agents with distinct roles; orchestrator routes between them. |
-| **Supervisor** | One supervisor LLM dispatches to worker agents based on task type. |
-| **Human-in-the-loop** | Execution pauses at defined checkpoints for user review or approval. |
-
-**Chosen:** <!-- state pattern + one-sentence rationale -->
+**Chosen:** Graph pipeline (LangGraph `StateGraph`) — a linear multi-step flow (`ingest → profile → render_report`) with a conditional error edge. Rationale: clean separation between ingesting, profiling, and rendering makes each step independently testable, and the conditional edge routes any failure to a single `handle_error` node.
 
 ---
 
 ## LLM Provider & Model
 
-<!-- FILL IN: Which model drives each agent/node? State provider, model ID, and why. -->
-
 | Agent / Node | Provider | Model ID | Rationale |
 |-------------|----------|----------|-----------|
-| <!-- node --> | Anthropic | <!-- e.g. claude-sonnet-4-6 --> | <!-- latency vs. quality trade-off --> |
+| `profile` (narrative sub-step) | Google Gemini | `gemini-2.5-flash` | Fast, low-cost summary generation; the only LLM use in the pipeline |
 
-**Fallback behaviour:** <!-- Production resilience only: retry/backoff, degraded mode, or a surfaced error if the LLM API is unavailable or rate-limited. NOT a test/offline stub path — tests call the real API with keys from `.env`. -->
+- Gemini is the **only** provider. Provider auto-detects from `AGENT_GEMINI_API_KEY`. Accessed via `LLMClient().call_model(prompt, system=None)`.
+- The LLM is used **only** to turn derived, aggregated statistics into a human-readable narrative. It **never** receives raw dataset rows (PII rule).
 
-**Prompt strategy:** <!-- System/user split, few-shot examples, structured output (tool_use / JSON mode)? -->
+**Fallback behaviour:** If the Gemini call errors or times out, the pipeline degrades to a **templated narrative** built from the same derived stats and still completes the run (status `completed`, narrative present, no crash). This is a production resilience path, not a test stub — tests call the real Gemini API with the key from `.env`.
+
+**Prompt strategy:** System prompt in `src/prompts/narrative.md`. The user prompt contains only aggregated statistics (row/column counts, dtypes, missingness summary, numeric min/mean/max/std, top categoricals, strongest correlations) as compact text. Output is a short plain-text executive summary.
 
 ---
 
 ## Tools & Tool Calling
 
-<!-- FILL IN: Every tool the agent can call. -->
+Tools are **pure functions** under `src/tools/`, invoked deterministically by the `profile`/`render_report` nodes (not LLM-selected).
 
-| Tool name | Description | Inputs | Output | Side-effects |
-|-----------|-------------|--------|--------|--------------|
-| <!-- name --> | <!-- what it does --> | <!-- params --> | <!-- return type --> | <!-- DB write, API call, file write, etc. --> |
+| Tool | Description | Inputs | Output | Side-effects |
+|------|-------------|--------|--------|--------------|
+| `profile_dataframe` | Computes per-column summary stats, missingness, and sample rows | pandas DataFrame | derived-stats dict | none (pure) |
+| `render_charts` | Renders histogram, boxplot, correlation heatmap (matplotlib Agg) | derived stats + DataFrame | dict of base64 PNG strings | none (pure) |
+| `render_report_html` | Assembles a single self-contained HTML document | derived stats + charts + narrative | HTML string | none (pure) |
 
-**Tool selection strategy:** <!-- How does the agent decide which tool to call? (LLM choice, rule-based routing, forced single tool) -->
+**Tool selection strategy:** Deterministic — each node calls its specific tool(s). No LLM tool routing.
 
-**Tool failure handling:** <!-- retry, fallback, abort — per tool or global policy? -->
+**Tool failure handling:** A tool exception sets `state["error"]` and routes to `handle_error`. The Gemini narrative call is the one non-fatal step: its failure falls back to a template rather than failing the run.
 
 ---
 
 ## Agent State
 
-<!-- FILL IN: The full state type. Every field must be named, typed, and annotated with what populates it. -->
-
 ```python
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     # Identity
-    run_id: int                          # set at initialisation
+    run_id: str                     # set at initialisation (SQLite runs.id)
 
     # Input
-    # ...                                # fields populated from the trigger
+    input_path: str                 # path to the uploaded CSV on local disk
+    filename: str                   # original uploaded filename
 
     # Pipeline data (populated progressively by nodes)
-    # ...
+    profile: dict | None            # derived, aggregated statistics (never raw rows)
 
     # Output
-    # ...                                # final result fields
+    narrative: str | None           # Gemini narrative, or templated fallback
+    report_html: str | None         # final self-contained HTML report
 
     # Control
-    error: str | None                    # set by any node on fatal failure
-    checkpoint: str | None              # last completed node (for resume)
+    status: str                     # "pending" | "completed" | "failed"
+    error: str | None               # set by any node on fatal failure
 ```
 
 ---
 
 ## Nodes / Steps
 
-<!-- FILL IN: One section per node. For single-agent loops, describe each "step" or "tool call phase." -->
+### `ingest`
 
-### `node_[name]`
-
-**Reads from state:** <!-- field names -->
-
-**Writes to state:** <!-- field names -->
-
-**LLM call:** <!-- yes/no; if yes: prompt template summary, model used, output format -->
-
+**Reads from state:** `input_path`
+**Writes to state:** `profile` is not written here; sets `status`, may set `error`
+**LLM call:** no
 **External calls:**
 
 | System | Operation | On Failure |
 |--------|-----------|------------|
-| <!-- system --> | <!-- what it calls --> | <!-- fatal (set error) / partial (log + continue) / retry --> |
+| Local disk | Read the uploaded CSV into a pandas DataFrame | fatal (set `error`) |
 
-**Behaviour:** <!-- One paragraph. What decision or transformation does this node perform? -->
+**Behaviour:** Reads and validates the CSV (parseable, non-empty). On a malformed/empty file sets `error`. The DataFrame is passed forward in-process; raw rows are never persisted or sent to the LLM.
+
+### `profile`
+
+**Reads from state:** the ingested DataFrame, `input_path`
+**Writes to state:** `profile`, `narrative`, `status`, may set `error`
+**LLM call:** yes — Gemini `gemini-2.5-flash`, derived aggregated stats only, plain-text output
+**External calls:**
+
+| System | Operation | On Failure |
+|--------|-----------|------------|
+| `profile_dataframe`, `render_charts` tools | Compute stats + render 3 charts | fatal (set `error`) |
+| Gemini | Generate narrative from derived stats | partial — fall back to templated narrative, continue |
+
+**Behaviour:** Computes summary stats, missingness, sample rows, and renders the histogram/boxplot/correlation-heatmap charts (base64 PNG). Then calls Gemini with the derived stats to produce the narrative; on Gemini failure it builds a templated narrative and continues.
+
+### `render_report`
+
+**Reads from state:** `profile`, charts, `narrative`
+**Writes to state:** `report_html`, `status`
+**LLM call:** no
+**External calls:** `render_report_html` tool (pure)
+**Behaviour:** Assembles a single self-contained HTML document (stats table, missingness table, sample-rows table, 3 embedded charts, narrative). No external I/O.
+
+### `train` (Phase 2 — deferred stub)
+
+Not wired in Phase 1. In Phase 2 this node will train a scikit-learn model on a labeled CSV and persist a `ModelArtifact`. Documented here so the graph can be extended without restructuring.
+
+### `handle_error`
+
+Sets `status="failed"`, keeps `error`, and logs context (structlog). Terminal.
 
 ---
 
 ## Graph / Flow Topology
 
-<!-- FILL IN: ASCII diagram of node flow. Show ALL conditional edges explicitly. -->
-
 ```
 START
   │
   ▼
-node_a ──(error)──► node_handle_error ──► END
+ingest ──(error)──► handle_error ──► END
   │
   ▼
-node_b ──(condition)──► node_c
-  │                         │
-  │                         ▼
-  └──────────────────► node_finalize
-                             │
-                             ▼
-                            END
+profile ──(error)──► handle_error ──► END
+  │
+  ▼
+render_report ──► END
 ```
 
 **Conditional edges:**
 
 | Source node | Condition | Target |
 |-------------|-----------|--------|
-| <!-- node --> | <!-- e.g. state["error"] is not None --> | <!-- target node --> |
+| ingest | `state.get("error")` set | handle_error |
+| ingest | otherwise | profile |
+| profile | `state.get("error")` set | handle_error |
+| profile | otherwise | render_report |
+
+(The Gemini narrative failure inside `profile` does NOT set `error` — it falls back to a template, so the flow proceeds to `render_report`.)
 
 ---
 
 ## Memory & Context
 
-<!-- FILL IN: How does the agent remember things across turns, steps, or runs? -->
-
 | Scope | Mechanism | What is stored |
 |-------|-----------|----------------|
-| **Within a run** | LangGraph state | All in-progress data |
-| **Across runs** | <!-- DB / vector store / none --> | <!-- e.g. past results, user prefs --> |
-| **Conversation** | <!-- message history / summary / none --> | <!-- if chat-style --> |
+| **Within a run** | In-process LangGraph state | DataFrame, derived stats, charts, narrative, report HTML |
+| **Across runs** | SQLite `runs` row | run id, status, filename, narrative, report HTML, error, timestamps — no raw rows |
+| **Conversation** | none | Not a chat agent; each run is independent |
 
-**Context window management:** <!-- How is the prompt kept within limits? (summary, sliding window, RAG retrieval) -->
+**Context window management:** N/A — the Gemini prompt contains only compact aggregated statistics, well within limits.
 
 ---
 
 ## Human-in-the-Loop Checkpoints
 
-<!-- FILL IN: Where does execution pause for human input? Delete section if not applicable. -->
-
-| Checkpoint | What is shown to the user | Expected user action | Timeout / default |
-|------------|--------------------------|----------------------|-------------------|
-| <!-- name --> | <!-- what the agent surfaces --> | <!-- approve / edit / abort --> | <!-- timeout action --> |
+None in Phase 1 — the pipeline runs to completion synchronously. (A pre-promotion approval gate may be added for Phase 2 model training.)
 
 ---
 
 ## Error Handling & Recovery
 
-<!-- FILL IN: How the agent handles failures at each level. -->
+**Node-level:** Each node catches its own exceptions; a fatal error sets `state["error"]` and the conditional edge routes to `handle_error`. The Gemini narrative call is the one non-fatal step (templated fallback).
 
-**Node-level:** <!-- Each node catches its own exceptions; fatal errors set state["error"] and route to handle_error node. -->
+**Graph-level (`handle_error`):** Sets `status="failed"`, preserves `error`, logs context; the API surfaces the error in the run response.
 
-**Graph-level (handle_error node):**
-- Reads: `state.error`, `state.run_id`
-- Updates DB: run status → "failed", `error_message`, `completed_at`
-- Logs error with `run_id` context
-- Terminates graph
+**Resume / retry strategy:** None in Phase 1 — runs are short and synchronous; a failed run is simply re-submitted.
 
-**Resume / retry strategy:** <!-- Can a failed run be resumed from its last checkpoint? How? -->
-
-**Partial failure:** <!-- If a non-critical step fails, does the agent degrade gracefully or abort? -->
+**Partial failure:** Only the narrative degrades gracefully (template fallback). A profiling or rendering failure fails the run cleanly with a surfaced error (no crash).
 
 ---
 
 ## Observability
 
-<!-- FILL IN: What is logged, traced, and measured? -->
-
 | Signal | What | Where |
 |--------|------|-------|
-| **Trace** | One trace per run, one span per node | <!-- OpenTelemetry / LangSmith / stdout --> |
-| **LLM calls** | Prompt tokens, completion tokens, latency, model | <!-- LangSmith / structured log --> |
-| **Tool calls** | Tool name, inputs, success/error, latency | Structured log |
-| **Run outcome** | Status, total duration, error if any | DB + structured log |
+| **Run outcome** | Status, duration, error | SQLite + structured log (structlog, stdout) |
+| **LLM call** | Prompt summary, latency, success/fallback | Structured log |
+| **Request/response** | Endpoint, run_id, status, latency | Structured log |
+
+No LangSmith / OpenTelemetry / Prometheus in Phase 1 — structured stdout logging only.
 
 ---
 
 ## Concurrency Model
 
-<!-- FILL IN: How concurrent agent runs are handled. -->
-
-- **Run isolation:** <!-- one-at-a-time (API returns 409) / queue / parallel with run_id scoping -->
-- **Parallel nodes within a run:** <!-- which nodes run in parallel and why -->
-- **Checkpointing:** <!-- none / SqliteSaver / PostgresSaver — required if human-in-the-loop or long-running -->
+Runs execute **synchronously** within their HTTP request; concurrency is handled by uvicorn's request handling (independent runs, independent SQLite rows). No worker pool, no node-level parallelism, no shared mutable state across runs in Phase 1.
 
 ---
 
-## Graph Assembly (`agent/graph.py`)
-
-<!-- FILL IN: Pseudocode showing how nodes and edges are wired. Must be ≤ 60 lines in the real file. -->
+## Graph Assembly (`src/graph/agent.py`)
 
 ```python
-graph = StateGraph(AgentState)
+from langgraph.graph import StateGraph, END
+from graph.state import AgentState
+from graph.nodes import ingest, profile, render_report, handle_error
+from graph.edges import after_ingest, after_profile
 
-graph.add_node("node_a", node_a)
-graph.add_node("node_b", node_b)
-graph.add_node("finalize", node_finalize)
-graph.add_node("handle_error", node_handle_error)
+def _build_graph():
+    g = StateGraph(AgentState)
+    g.add_node("ingest", ingest)
+    g.add_node("profile", profile)
+    g.add_node("render_report", render_report)
+    g.add_node("handle_error", handle_error)
 
-graph.set_entry_point("node_a")
+    g.set_entry_point("ingest")
+    g.add_conditional_edges(
+        "ingest", after_ingest,
+        {"profile": "profile", "handle_error": "handle_error"},
+    )
+    g.add_conditional_edges(
+        "profile", after_profile,
+        {"render_report": "render_report", "handle_error": "handle_error"},
+    )
+    g.add_edge("render_report", END)
+    g.add_edge("handle_error", END)
+    return g.compile()
 
-graph.add_conditional_edges(
-    "node_a",
-    lambda s: "handle_error" if s.get("error") else "node_b",
-)
-
-graph.add_edge("node_b", "finalize")
-graph.add_edge("finalize", END)
-graph.add_edge("handle_error", END)
-
-compiled_graph = graph.compile()
+agentic_ai = _build_graph()
 ```

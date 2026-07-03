@@ -1,32 +1,38 @@
 # UI
 
-> **Boilerplate status:** Delete this file if the agent has no UI. Otherwise, filled in by the spec-writer sub-agent.
-
----
-
 ## UI Type
 
-<!-- FILL IN: Web dashboard / CLI / chat interface / none -->
+Single-page Next.js static-export app, served **same-origin** by FastAPI at `/app/`. It calls the backend via relative paths (e.g. `/runs`) with **no `/api/v1` prefix**. The whole Phase 1 flow lives on one page.
 
 ## Views / Screens
 
-<!-- FILL IN: One section per major view. -->
+### Screen: Upload + Report (single page — `frontend/src/app/page.tsx`)
 
-### Screen: <!-- Name -->
+Purpose: upload a CSV, run EDA, and view/download the resulting report.
 
-**Purpose:** <!-- what the user does here -->
+Key elements (real, on the tested path):
+- **CSV upload** — a dropzone / file input that accepts a single `.csv`.
+- **Progress state** — a "Running analysis…" indicator while the synchronous `POST /runs` request is in flight.
+- **Report viewer** — embeds the returned HTML report same-origin (via `iframe` `src=/runs/{run_id}/report` or `srcdoc`).
+- **Download button** — downloads the self-contained HTML report.
+- **Error states** — inline validation for bad uploads (non-CSV, empty, too large) and a clear error box (with `run_id`) if a run fails.
 
-**Key elements:**
-- <!-- element 1 -->
-- <!-- element 2 -->
+Labelled NON-FUNCTIONAL stubs (must visibly read "Coming soon" so they are never mistaken for bugs):
+- **Train a model (Phase 2)** — disabled section marked "Coming soon".
+- **Schedule runs (Phase 3)** — disabled section marked "Coming soon".
 
-**Actions available:**
-- <!-- action 1 -->
+## Interaction Flow
+
+1. User selects/drops a CSV → clicks Analyze.
+2. Frontend `POST /runs` (multipart, field `file`) → shows progress.
+3. On `status: "completed"`, embed the report from `report_url` and enable Download; show the narrative.
+4. On `400/413` or `status: "failed"`, show the inline/box error.
 
 ## Error States
 
-<!-- FILL IN: How does the UI surface errors and loading states to the user? -->
+- Inline validation for upload problems (non-CSV, empty, too large).
+- Run-level failure shows a clear error box including `run_id`.
 
-## Tech Stack
+## E2E Tests
 
-<!-- FILL IN: Filled in by spec-writer. E.g., Next.js 15 + React 19 + Tailwind -->
+A `frontend/tests/e2e/` Playwright suite covers the primary journey: load `/app/`, upload a fixture CSV, wait for the report to render, and assert the report iframe + download button appear and the Train/Schedule sections are labelled "Coming soon". This suite is a Phase 1 deliverable and runs against the real running app.
